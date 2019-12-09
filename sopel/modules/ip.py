@@ -149,7 +149,7 @@ def ip(bot, trigger):
         except (socket.error, socket.herror):
             try:
                 query = socket.getaddrinfo(query, None)[0][4][0]
-            except socket.gaierror:
+            except (socket.gaierror, UnicodeError):
                 return bot.say("[IP/Host Lookup] Unable to resolve IP/Hostname")
     else:
         return bot.say("[IP/Host Lookup] Unable to resolve IP/Hostname")
