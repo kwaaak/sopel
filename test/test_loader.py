@@ -1,12 +1,12 @@
 # coding=utf-8
-"""Test for the ``sopel.loader`` module."""
-import imp
+"""Tests for the ``sopel.loader`` module."""
+from __future__ import unicode_literals, absolute_import, print_function, division
+
 import inspect
-import os
 
 import pytest
 
-from sopel import loader, config, module
+from sopel import loader, module, plugins
 
 
 MOCK_MODULE_CONTENT = """# coding=utf-8
@@ -62,88 +62,54 @@ def func():
     return bot_command
 
 
+TMP_CONFIG = """
+[core]
+owner = testnick
+nick = TestBot
+"""
+
+
 @pytest.fixture
-def tmpconfig(tmpdir):
-    conf_file = tmpdir.join('conf.ini')
-    conf_file.write("\n".join([
-        "[core]",
-        "owner=testnick",
-        "nick = TestBot",
-        ""
-    ]))
-    return config.Config(conf_file.strpath)
+def tmpconfig(configfactory):
+    return configfactory('conf.ini', TMP_CONFIG)
 
 
-def test_get_module_description_good_file(tmpdir):
-    root = tmpdir.mkdir('loader_mods')
-    test_file = root.join('file_module.py')
-    test_file.write('')
-
-    filename = test_file.strpath
-    assert loader.get_module_description(filename) == (
-        'file_module', filename, imp.PY_SOURCE
-    )
-
-
-def test_get_module_description_bad_file_pyc(tmpdir):
-    root = tmpdir.mkdir('loader_mods')
-    test_file = root.join('file_module.pyc')
-    test_file.write('')
-
-    filename = test_file.strpath
-    assert loader.get_module_description(filename) is None
-
-
-def test_get_module_description_bad_file_no_ext(tmpdir):
-    root = tmpdir.mkdir('loader_mods')
-    test_file = root.join('file_module')
-    test_file.write('')
-
-    filename = test_file.strpath
-    assert loader.get_module_description(filename) is None
-
-
-def test_get_module_description_good_dir(tmpdir):
-    root = tmpdir.mkdir('loader_mods')
-    test_dir = root.mkdir('dir_package')
-    test_dir.join('__init__.py').write('')
-
-    filename = test_dir.strpath
-    assert loader.get_module_description(filename) == (
-        'dir_package', filename, imp.PKG_DIRECTORY
-    )
-
-
-def test_get_module_description_bad_dir_empty(tmpdir):
-    root = tmpdir.mkdir('loader_mods')
-    test_dir = root.mkdir('dir_package')
-
-    filename = test_dir.strpath
-    assert loader.get_module_description(filename) is None
-
-
-def test_get_module_description_bad_dir_no_init(tmpdir):
-    root = tmpdir.mkdir('loader_mods')
-    test_dir = root.mkdir('dir_package')
-    test_dir.join('no_init.py').write('')
-
-    filename = test_dir.strpath
-    assert loader.get_module_description(filename) is None
-
-
-def test_clean_module_commands(tmpdir, tmpconfig):
+@pytest.fixture
+def testplugin(tmpdir):
     root = tmpdir.mkdir('loader_mods')
     mod_file = root.join('file_mod.py')
     mod_file.write(MOCK_MODULE_CONTENT)
 
-    test_mod, _ = loader.load_module(
-        'file_mod', mod_file.strpath, imp.PY_SOURCE)
+    return plugins.handlers.PyFilePlugin(mod_file.strpath)
+
+
+def test_is_triggerable(testplugin):
+    """Test is_triggerable behavior before clean_module is called."""
+    testplugin.load()
+    test_mod = testplugin._module
+
+    assert loader.is_triggerable(test_mod.first_command)
+    assert loader.is_triggerable(test_mod.second_command)
+    assert loader.is_triggerable(test_mod.on_topic_command)
+
+    assert not loader.is_triggerable(test_mod.interval5s)
+    assert not loader.is_triggerable(test_mod.interval10s)
+
+    assert not loader.is_triggerable(test_mod.shutdown)
+    assert not loader.is_triggerable(test_mod.example_url)
+
+
+def test_clean_module(testplugin, tmpconfig):
+    testplugin.load()
+    test_mod = testplugin._module
+
     callables, jobs, shutdowns, urls = loader.clean_module(
         test_mod, tmpconfig)
 
-    assert len(callables) == 2
+    assert len(callables) == 3
     assert test_mod.first_command in callables
     assert test_mod.second_command in callables
+    assert test_mod.on_topic_command in callables
     assert len(jobs) == 2
     assert test_mod.interval5s in jobs
     assert test_mod.interval10s in jobs
@@ -152,6 +118,17 @@ def test_clean_module_commands(tmpdir, tmpconfig):
     assert len(urls) == 1
     assert test_mod.example_url in urls
 
+    # assert is_triggerable behavior *after* clean_module has been called
+    assert loader.is_triggerable(test_mod.first_command)
+    assert loader.is_triggerable(test_mod.second_command)
+    assert loader.is_triggerable(test_mod.on_topic_command)
+
+    assert not loader.is_triggerable(test_mod.interval5s)
+    assert not loader.is_triggerable(test_mod.interval10s)
+
+    assert not loader.is_triggerable(test_mod.shutdown)
+    assert not loader.is_triggerable(test_mod.example_url)
+
     # ignored function is ignored
     assert test_mod.ignored not in callables
     assert test_mod.ignored not in jobs
@@ -159,7 +136,63 @@ def test_clean_module_commands(tmpdir, tmpconfig):
     assert test_mod.ignored not in urls
 
 
+def test_clean_module_idempotency(testplugin, tmpconfig):
+    testplugin.load()
+    test_mod = testplugin._module
+
+    callables, jobs, shutdowns, urls = loader.clean_module(
+        test_mod, tmpconfig)
+
+    # sanity assertions: check test_clean_module if any of these fails
+    assert len(callables) == 3
+    assert len(jobs) == 2
+    assert len(shutdowns) == 1
+    assert len(urls) == 1
+
+    # recall clean_module, we should have the same result
+    new_callables, new_jobs, new_shutdowns, new_urls = loader.clean_module(
+        test_mod, tmpconfig)
+
+    assert new_callables == callables
+    assert new_jobs == jobs
+    assert new_shutdowns == shutdowns
+    assert new_urls == new_urls
+
+    # assert is_triggerable behavior
+    assert loader.is_triggerable(test_mod.first_command)
+    assert loader.is_triggerable(test_mod.second_command)
+    assert loader.is_triggerable(test_mod.on_topic_command)
+
+    assert not loader.is_triggerable(test_mod.interval5s)
+    assert not loader.is_triggerable(test_mod.interval10s)
+
+    assert not loader.is_triggerable(test_mod.shutdown)
+    assert not loader.is_triggerable(test_mod.example_url)
+
+
 def test_clean_callable_default(tmpconfig, func):
+    loader.clean_callable(func, tmpconfig)
+
+    # Default values
+    assert hasattr(func, 'thread')
+    assert func.thread is True
+
+    # Not added by default
+    assert not hasattr(func, 'unblockable')
+    assert not hasattr(func, 'priority')
+    assert not hasattr(func, 'rate')
+    assert not hasattr(func, 'channel_rate')
+    assert not hasattr(func, 'global_rate')
+    assert not hasattr(func, 'event')
+    assert not hasattr(func, 'rule')
+    assert not hasattr(func, 'commands')
+    assert not hasattr(func, 'nickname_commands')
+    assert not hasattr(func, 'action_commands')
+    assert not hasattr(func, 'intents')
+
+
+def test_clean_callable_command(tmpconfig, func):
+    setattr(func, 'commands', ['test'])
     loader.clean_callable(func, tmpconfig)
 
     # Default values
@@ -172,16 +205,13 @@ def test_clean_callable_default(tmpconfig, func):
     assert hasattr(func, 'rate')
     assert func.rate == 0
     assert hasattr(func, 'channel_rate')
-    assert func.rate == 0
+    assert func.channel_rate == 0
     assert hasattr(func, 'global_rate')
     assert func.global_rate == 0
     assert hasattr(func, 'event')
     assert func.event == ['PRIVMSG']
-
-    # Not added by default
-    assert not hasattr(func, 'rule')
-    assert not hasattr(func, 'commands')
-    assert not hasattr(func, 'intents')
+    assert hasattr(func, 'rule')
+    assert len(func.rule) == 1
 
 
 def test_clean_callable_event(tmpconfig, func):
@@ -191,12 +221,41 @@ def test_clean_callable_event(tmpconfig, func):
     assert hasattr(func, 'event')
     assert func.event == ['LOW', 'UP', 'MIXED']
 
+    # Default values
+    assert hasattr(func, 'unblockable')
+    assert func.unblockable is False
+    assert hasattr(func, 'priority')
+    assert func.priority == 'medium'
+    assert hasattr(func, 'thread')
+    assert func.thread is True
+    assert hasattr(func, 'rate')
+    assert func.rate == 0
+    assert hasattr(func, 'channel_rate')
+    assert func.channel_rate == 0
+    assert hasattr(func, 'global_rate')
+    assert func.global_rate == 0
+
+    # idempotency
+    loader.clean_callable(func, tmpconfig)
+    assert func.event == ['LOW', 'UP', 'MIXED']
+
+    assert func.unblockable is False
+    assert func.priority == 'medium'
+    assert func.thread is True
+    assert func.rate == 0
+    assert func.channel_rate == 0
+    assert func.global_rate == 0
+
 
 def test_clean_callable_event_string(tmpconfig, func):
     setattr(func, 'event', 'some')
     loader.clean_callable(func, tmpconfig)
 
     assert hasattr(func, 'event')
+    assert func.event == ['SOME']
+
+    # idempotency
+    loader.clean_callable(func, tmpconfig)
     assert func.event == ['SOME']
 
 
@@ -213,6 +272,32 @@ def test_clean_callable_rule(tmpconfig, func):
     assert regex.match('abcd')
     assert not regex.match('efg')
 
+    # Default values
+    assert hasattr(func, 'unblockable')
+    assert func.unblockable is False
+    assert hasattr(func, 'priority')
+    assert func.priority == 'medium'
+    assert hasattr(func, 'thread')
+    assert func.thread is True
+    assert hasattr(func, 'rate')
+    assert func.rate == 0
+    assert hasattr(func, 'channel_rate')
+    assert func.channel_rate == 0
+    assert hasattr(func, 'global_rate')
+    assert func.global_rate == 0
+
+    # idempotency
+    loader.clean_callable(func, tmpconfig)
+    assert len(func.rule) == 1
+    assert regex in func.rule
+
+    assert func.unblockable is False
+    assert func.priority == 'medium'
+    assert func.thread is True
+    assert func.rate == 0
+    assert func.channel_rate == 0
+    assert func.global_rate == 0
+
 
 def test_clean_callable_rule_string(tmpconfig, func):
     setattr(func, 'rule', r'abc')
@@ -226,6 +311,11 @@ def test_clean_callable_rule_string(tmpconfig, func):
     assert regex.match('abc')
     assert regex.match('abcd')
     assert not regex.match('efg')
+
+    # idempotency
+    loader.clean_callable(func, tmpconfig)
+    assert len(func.rule) == 1
+    assert regex in func.rule
 
 
 def test_clean_callable_rule_nick(tmpconfig, func):
@@ -242,6 +332,11 @@ def test_clean_callable_rule_nick(tmpconfig, func):
     assert regex.match('TestBot, hello')
     assert not regex.match('TestBot not hello')
 
+    # idempotency
+    loader.clean_callable(func, tmpconfig)
+    assert len(func.rule) == 1
+    assert regex in func.rule
+
 
 def test_clean_callable_rule_nickname(tmpconfig, func):
     """Assert ``$nick`` in a rule will match ``TestBot``."""
@@ -255,6 +350,11 @@ def test_clean_callable_rule_nickname(tmpconfig, func):
     regex = func.rule[0]
     assert regex.match('TestBot hello')
     assert not regex.match('TestBot not hello')
+
+    # idempotency
+    loader.clean_callable(func, tmpconfig)
+    assert len(func.rule) == 1
+    assert regex in func.rule
 
 
 def test_clean_callable_nickname_command(tmpconfig, func):
@@ -272,6 +372,52 @@ def test_clean_callable_nickname_command(tmpconfig, func):
     assert regex.match('TestBot, hello!')
     assert regex.match('TestBot: hello!')
     assert not regex.match('TestBot not hello')
+
+    # Default values
+    assert hasattr(func, 'unblockable')
+    assert func.unblockable is False
+    assert hasattr(func, 'priority')
+    assert func.priority == 'medium'
+    assert hasattr(func, 'thread')
+    assert func.thread is True
+    assert hasattr(func, 'rate')
+    assert func.rate == 0
+    assert hasattr(func, 'channel_rate')
+    assert func.channel_rate == 0
+    assert hasattr(func, 'global_rate')
+    assert func.global_rate == 0
+
+    # idempotency
+    loader.clean_callable(func, tmpconfig)
+    assert len(func.rule) == 1
+    assert regex in func.rule
+
+    assert func.unblockable is False
+    assert func.priority == 'medium'
+    assert func.thread is True
+    assert func.rate == 0
+    assert func.channel_rate == 0
+    assert func.global_rate == 0
+
+
+def test_clean_callable_action_command(tmpconfig, func):
+    setattr(func, 'action_commands', ['bots'])
+    loader.clean_callable(func, tmpconfig)
+
+    assert hasattr(func, 'action_commands')
+    assert len(func.action_commands) == 1
+    assert func.action_commands == ['bots']
+    assert hasattr(func, 'rule')
+    assert len(func.rule) == 1
+
+    regex = func.rule[0]
+    assert regex.match('bots bottingly')
+    assert not regex.match('spams spammingly')
+
+    # idempotency
+    loader.clean_callable(func, tmpconfig)
+    assert len(func.rule) == 1
+    assert regex in func.rule
 
 
 def test_clean_callable_events(tmpconfig, func):
@@ -294,7 +440,7 @@ def test_clean_callable_events(tmpconfig, func):
     assert func.event == ['TOPIC', 'JOIN', 'NICK']
 
 
-def test_clean_callable_events_basetring(tmpconfig, func):
+def test_clean_callable_events_basestring(tmpconfig, func):
     setattr(func, 'event', 'topic')
     loader.clean_callable(func, tmpconfig)
 
@@ -321,7 +467,22 @@ def test_clean_callable_example(tmpconfig, func):
     docs = func._docs['test']
     assert len(docs) == 2
     assert docs[0] == inspect.cleandoc(func.__doc__).splitlines()
-    assert docs[1] == '.test hello'
+    assert docs[1] == ['.test hello']
+
+
+def test_clean_callable_example_not_set(tmpconfig, func):
+    module.commands('test')(func)
+
+    loader.clean_callable(func, tmpconfig)
+
+    assert hasattr(func, '_docs')
+    assert len(func._docs) == 1
+    assert 'test' in func._docs
+
+    docs = func._docs['test']
+    assert len(docs) == 2
+    assert docs[0] == inspect.cleandoc(func.__doc__).splitlines()
+    assert docs[1] == []
 
 
 def test_clean_callable_example_multi_commands(tmpconfig, func):
@@ -342,7 +503,7 @@ def test_clean_callable_example_multi_commands(tmpconfig, func):
     assert test_docs == unit_docs
 
     assert test_docs[0] == inspect.cleandoc(func.__doc__).splitlines()
-    assert test_docs[1] == '.test hello'
+    assert test_docs[1] == ['.test hello']
 
 
 def test_clean_callable_example_first_only(tmpconfig, func):
@@ -358,7 +519,7 @@ def test_clean_callable_example_first_only(tmpconfig, func):
     docs = func._docs['test']
     assert len(docs) == 2
     assert docs[0] == inspect.cleandoc(func.__doc__).splitlines()
-    assert docs[1] == '.test hello'
+    assert docs[1] == ['.test hello']
 
 
 def test_clean_callable_example_first_only_multi_commands(tmpconfig, func):
@@ -380,7 +541,54 @@ def test_clean_callable_example_first_only_multi_commands(tmpconfig, func):
     assert test_docs == unit_docs
 
     assert test_docs[0] == inspect.cleandoc(func.__doc__).splitlines()
-    assert test_docs[1] == '.test hello'
+    assert test_docs[1] == ['.test hello']
+
+
+def test_clean_callable_example_user_help(tmpconfig, func):
+    module.commands('test')(func)
+    module.example('.test hello', user_help=True)(func)
+
+    loader.clean_callable(func, tmpconfig)
+
+    assert len(func._docs) == 1
+    assert 'test' in func._docs
+
+    docs = func._docs['test']
+    assert len(docs) == 2
+    assert docs[0] == inspect.cleandoc(func.__doc__).splitlines()
+    assert docs[1] == ['.test hello']
+
+
+def test_clean_callable_example_user_help_multi(tmpconfig, func):
+    module.commands('test')(func)
+    module.example('.test hello', user_help=True)(func)
+    module.example('.test bonjour', user_help=True)(func)
+
+    loader.clean_callable(func, tmpconfig)
+
+    assert len(func._docs) == 1
+    assert 'test' in func._docs
+
+    docs = func._docs['test']
+    assert len(docs) == 2
+    assert docs[0] == inspect.cleandoc(func.__doc__).splitlines()
+    assert docs[1] == ['.test hello', '.test bonjour']
+
+
+def test_clean_callable_example_user_help_mixed(tmpconfig, func):
+    module.commands('test')(func)
+    module.example('.test hello')(func)
+    module.example('.test bonjour', user_help=True)(func)
+
+    loader.clean_callable(func, tmpconfig)
+
+    assert len(func._docs) == 1
+    assert 'test' in func._docs
+
+    docs = func._docs['test']
+    assert len(docs) == 2
+    assert docs[0] == inspect.cleandoc(func.__doc__).splitlines()
+    assert docs[1] == ['.test bonjour']
 
 
 def test_clean_callable_example_default_prefix(tmpconfig, func):
@@ -396,7 +604,7 @@ def test_clean_callable_example_default_prefix(tmpconfig, func):
     docs = func._docs['test']
     assert len(docs) == 2
     assert docs[0] == inspect.cleandoc(func.__doc__).splitlines()
-    assert docs[1] == '!test hello'
+    assert docs[1] == ['!test hello']
 
 
 def test_clean_callable_example_nickname(tmpconfig, func):
@@ -411,7 +619,23 @@ def test_clean_callable_example_nickname(tmpconfig, func):
     docs = func._docs['test']
     assert len(docs) == 2
     assert docs[0] == inspect.cleandoc(func.__doc__).splitlines()
-    assert docs[1] == 'TestBot: hello'
+    assert docs[1] == ['TestBot: hello']
+
+
+def test_clean_callable_example_nickname_custom_prefix(tmpconfig, func):
+    module.commands('test')(func)
+    module.example('$nickname: hello')(func)
+
+    tmpconfig.core.help_prefix = '!'
+    loader.clean_callable(func, tmpconfig)
+
+    assert len(func._docs) == 1
+    assert 'test' in func._docs
+
+    docs = func._docs['test']
+    assert len(docs) == 2
+    assert docs[0] == inspect.cleandoc(func.__doc__).splitlines()
+    assert docs[1] == ['TestBot: hello']
 
 
 def test_clean_callable_intents(tmpconfig, func):
@@ -429,50 +653,28 @@ def test_clean_callable_intents(tmpconfig, func):
     assert regex.match('AbCdE')
     assert not regex.match('efg')
 
+    # Default values
+    assert hasattr(func, 'unblockable')
+    assert func.unblockable is False
+    assert hasattr(func, 'priority')
+    assert func.priority == 'medium'
+    assert hasattr(func, 'thread')
+    assert func.thread is True
+    assert hasattr(func, 'rate')
+    assert func.rate == 0
+    assert hasattr(func, 'channel_rate')
+    assert func.channel_rate == 0
+    assert hasattr(func, 'global_rate')
+    assert func.global_rate == 0
 
-def test_load_module_pymod(tmpdir):
-    root = tmpdir.mkdir('loader_mods')
-    mod_file = root.join('file_mod.py')
-    mod_file.write(MOCK_MODULE_CONTENT)
+    # idempotency
+    loader.clean_callable(func, tmpconfig)
+    assert len(func.intents) == 1
+    assert regex in func.intents
 
-    test_mod, timeinfo = loader.load_module(
-        'file_mod', mod_file.strpath, imp.PY_SOURCE)
-
-    assert hasattr(test_mod, 'first_command')
-    assert hasattr(test_mod, 'second_command')
-    assert hasattr(test_mod, 'interval5s')
-    assert hasattr(test_mod, 'interval10s')
-    assert hasattr(test_mod, 'example_url')
-    assert hasattr(test_mod, 'shutdown')
-    assert hasattr(test_mod, 'ignored')
-
-    assert timeinfo == os.path.getmtime(mod_file.strpath)
-
-
-def test_load_module_pypackage(tmpdir):
-    root = tmpdir.mkdir('loader_mods')
-    package_dir = root.mkdir('dir_mod')
-    mod_file = package_dir.join('__init__.py')
-    mod_file.write(MOCK_MODULE_CONTENT)
-
-    test_mod, timeinfo = loader.load_module(
-        'dir_mod', package_dir.strpath, imp.PKG_DIRECTORY)
-
-    assert hasattr(test_mod, 'first_command')
-    assert hasattr(test_mod, 'second_command')
-    assert hasattr(test_mod, 'interval5s')
-    assert hasattr(test_mod, 'interval10s')
-    assert hasattr(test_mod, 'example_url')
-    assert hasattr(test_mod, 'shutdown')
-    assert hasattr(test_mod, 'ignored')
-
-    assert timeinfo == os.path.getmtime(package_dir.strpath)
-
-
-def test_load_module_error(tmpdir):
-    root = tmpdir.mkdir('loader_mods')
-    mod_file = root.join('file_mod.py')
-    mod_file.write(MOCK_MODULE_CONTENT)
-
-    with pytest.raises(TypeError):
-        loader.load_module('file_mod', mod_file.strpath, None)
+    assert func.unblockable is False
+    assert func.priority == 'medium'
+    assert func.thread is True
+    assert func.rate == 0
+    assert func.channel_rate == 0
+    assert func.global_rate == 0

@@ -1,10 +1,10 @@
 # coding=utf-8
 """Types for creating section definitions.
 
-A section definition consists of a subclass of ``StaticSection``, on which any
-number of subclasses of ``BaseValidated`` (a few common ones of which are
-available in this module) are assigned as attributes. These descriptors define
-how to read values from, and write values to, the config file.
+A section definition consists of a subclass of :class:`StaticSection`, on which
+any number of subclasses of :class:`BaseValidated` (a few common ones of which
+are available in this module) are assigned as attributes. These descriptors
+define how to read values from, and write values to, the config file.
 
 As an example, if one wanted to define the ``[spam]`` section as having an
 ``eggs`` option, which contains a list of values, they could do this:
@@ -27,6 +27,7 @@ As an example, if one wanted to define the ``[spam]`` section as having an
 from __future__ import unicode_literals, absolute_import, print_function, division
 
 import os.path
+import re
 import sys
 from sopel.tools import get_input
 
@@ -42,7 +43,8 @@ class NO_DEFAULT(object):
 class StaticSection(object):
     """A configuration section with parsed and validated settings.
 
-    This class is intended to be subclassed with added ``ValidatedAttribute``\\s.
+    This class is intended to be subclassed and customized with added
+    attributes containing :class:`BaseValidated`-based objects.
     """
     def __init__(self, config, section_name, validate=True):
         if not config.parser.has_section(section_name):
@@ -68,7 +70,10 @@ class StaticSection(object):
     def configure_setting(self, name, prompt, default=NO_DEFAULT):
         """Return a validated value for this attribute from the terminal.
 
-        ``prompt`` will be the docstring of the attribute if not given.
+        :param str name: the name of the attribute to configure
+        :param str prompt: the prompt text to display in the terminal
+        :param default: the value to be used if the user does not enter one
+        :type default: depends on subclass
 
         If ``default`` is passed, it will be used if no value is given by the
         user. If it is not passed, the current value of the setting, or the
@@ -96,19 +101,30 @@ class StaticSection(object):
         setattr(self, name, value)
 
 
+# TODO: Make this a proper abstract class when dropping Python 2 support.
+# Abstract classes are much simpler to deal with once we only need to worry
+# about Python 3.4 or newer. (https://stackoverflow.com/a/13646263/5991)
 class BaseValidated(object):
-    """The base type for a descriptor in a ``StaticSection``."""
+    """The base type for a setting descriptor in a :class:`StaticSection`.
+
+    :param str name: the attribute name to use in the config file
+    :param default: the value to be returned if the setting has no value;
+                    if not specified, defaults to :obj:`None`
+    :type default: str, optional
+
+    ``default`` also can be set to :const:`sopel.config.types.NO_DEFAULT`, if
+    the value *must* be configured by the user (i.e. there is no suitable
+    default value). Trying to read an empty ``NO_DEFAULT`` value will raise
+    :class:`AttributeError`.
+    """
     def __init__(self, name, default=None):
-        """
-        ``name`` is the name of the setting in the section.
-        ``default`` is the value to be returned if the setting is not set. If
-        not given, AttributeError will be raised instead.
-        """
         self.name = name
         self.default = default
 
     def configure(self, prompt, default, parent, section_name):
-        """With the prompt and default, parse and return a value from terminal.
+        """
+        With the ``prompt`` and ``default``, parse and return a value from
+        terminal.
         """
         if default is not NO_DEFAULT and default is not None:
             prompt = '{} [{}]'.format(prompt, default)
@@ -118,14 +134,14 @@ class BaseValidated(object):
         value = value or default
         return self.parse(value)
 
-    def serialize(self, value):
+    def serialize(self, value, *args, **kwargs):
         """Take some object, and return the string to be saved to the file.
 
         Must be implemented in subclasses.
         """
         raise NotImplementedError("Serialize method must be implemented in subclass")
 
-    def parse(self, value):
+    def parse(self, value, *args, **kwargs):
         """Take a string from the file, and return the appropriate object.
 
         Must be implemented in subclasses."""
@@ -156,6 +172,8 @@ class BaseValidated(object):
 
     def __set__(self, instance, value):
         if value is None:
+            if self.default == NO_DEFAULT:
+                raise ValueError('Cannot unset an option with a required value.')
             instance._parser.remove_option(instance._section_name, self.name)
             return
         value = self.serialize(value)
@@ -178,30 +196,48 @@ def _serialize_boolean(value):
 
 
 class ValidatedAttribute(BaseValidated):
-    def __init__(self, name, parse=None, serialize=None, default=None):
-        """A descriptor for settings in a ``StaticSection``
+    """A descriptor for settings in a :class:`StaticSection`.
 
-        ``parse`` is the function to be used to read the string and create the
-        appropriate object. If not given, return the string as-is.
-        ``serialize`` takes an object, and returns the value to be written to
-        the file. If not given, defaults to ``unicode``.
-        """
-        self.name = name
+    :param str name: the attribute name to use in the config file
+    :param parse: a function to be used to read the string and create the
+                  appropriate object; the string value will be returned
+                  as-is if not set
+    :type parse: :term:`function`, optional
+    :param serialize: a function that, given an object, should return a string
+                      that can be written to the config file safely; defaults
+                      to :class:`str`
+    :type serialize: :term:`function`, optional
+    """
+    def __init__(self, name, parse=None, serialize=None, default=None):
+        super(ValidatedAttribute, self).__init__(name, default=default)
         if parse == bool:
             parse = _parse_boolean
             if not serialize or serialize == bool:
                 serialize = _serialize_boolean
         self.parse = parse or self.parse
         self.serialize = serialize or self.serialize
-        self.default = default
 
     def serialize(self, value):
+        """Return the ``value`` as a Unicode string.
+
+        :param value: the option value
+        :rtype: str
+        """
         return unicode(value)
 
     def parse(self, value):
+        """No-op: simply returns the given ``value``, unchanged.
+
+        :param str value: the string read from the config file
+        :rtype: str
+        """
         return value
 
     def configure(self, prompt, default, parent, section_name):
+        """
+        With the ``prompt`` and ``default``, parse and return a value from
+        terminal.
+        """
         if self.parse == _parse_boolean:
             prompt += ' (y/n)'
             default = 'y' if default else 'n'
@@ -211,62 +247,223 @@ class ValidatedAttribute(BaseValidated):
 class ListAttribute(BaseValidated):
     """A config attribute containing a list of string values.
 
-    Values are saved to the file as a comma-separated list. It does not
-    currently support commas within items in the list. By default, the spaces
-    before and after each item are stripped; you can override this by passing
-    ``strip=False``."""
+    :param str name: the attribute name to use in the config file
+    :param strip: whether to strip whitespace from around each value (applies
+                  only to legacy comma-separated lists; multi-line lists are
+                  always stripped)
+    :type strip: bool, optional
+    :param default: the default value if the config file does not define a
+                    value for this option; to require explicit configuration,
+                    use :const:`sopel.config.types.NO_DEFAULT`
+    :type default: list, optional
+
+    From this :class:`StaticSection`::
+
+        class SpamSection(StaticSection):
+            cheeses = ListAttribute('cheeses')
+
+    the option will be exposed as a Python :class:`list`::
+
+        >>> config.spam.cheeses
+        ['camembert', 'cheddar', 'reblochon', '#brie']
+
+    which comes from this configuration file:
+
+    .. code-block:: ini
+
+        [spam]
+        cheeses =
+            camembert
+            cheddar
+            reblochon
+            "#brie"
+
+    Note that the ``#brie`` item starts with a ``#``, hence the double quote:
+    without these quotation marks, the config parser would think it's a
+    comment. The quote/unquote is managed automatically by this field, and
+    if and only if it's necessary (see :meth:`parse` and :meth:`serialize`).
+
+    .. versionchanged:: 7.0
+
+        The option's value will be split on newlines by default. In this
+        case, the ``strip`` parameter has no effect.
+
+        See the :meth:`parse` method for more information.
+
+    .. note::
+
+        **About:** backward compatibility with comma-separated values.
+
+        A :class:`ListAttribute` option allows to write, on a single line,
+        the values separated by commas. As of Sopel 7.x this behavior is
+        discouraged. It will be deprecated in Sopel 8.x, then removed in
+        Sopel 9.x.
+
+        Bot owners are encouraged to update their configurations to use
+        newlines instead of commas.
+
+        The comma delimiter fallback does not support commas within items in
+        the list.
+    """
+    DELIMITER = ','
+    QUOTE_REGEX = re.compile(r'^"(?P<value>#.*)"$')
+    """Regex pattern to match value that requires quotation marks.
+
+    This pattern matches values that start with ``#`` inside quotation marks
+    only: ``"#sopel"`` will match, but ``"sopel"`` won't, and neither will any
+    variant that doesn't conform to this pattern.
+    """
+
     def __init__(self, name, strip=True, default=None):
         default = default or []
         super(ListAttribute, self).__init__(name, default=default)
         self.strip = strip
 
     def parse(self, value):
-        value = list(filter(None, value.split(',')))
-        if self.strip:
-            return [v.strip() for v in value]
+        """Parse ``value`` into a list.
+
+        :param str value: a multi-line string of values to parse into a list
+        :return: a list of items from ``value``
+        :rtype: list
+
+        .. versionchanged:: 7.0
+
+            The value is now split on newlines, with fallback to comma
+            when there is no newline in ``value``.
+
+            When modified and saved to a file, items will be stored as a
+            multi-line string (see :meth:`serialize`).
+        """
+        if "\n" in value:
+            items = (
+                # remove trailing comma
+                # because `value,\nother` is valid in Sopel 7.x
+                item.strip(self.DELIMITER).strip()
+                for item in value.splitlines())
         else:
-            return value
+            # this behavior will be:
+            # - Discouraged in Sopel 7.x (in the documentation)
+            # - Deprecated in Sopel 8.x
+            # - Removed from Sopel 9.x
+            items = value.split(self.DELIMITER)
+
+        items = (self.parse_item(item) for item in items if item)
+        if self.strip:
+            return [item.strip() for item in items]
+
+        return list(items)
+
+    def parse_item(self, item):
+        """Parse one ``item`` from the list.
+
+        :param str item: one item from the list to parse
+        :rtype: str
+
+        If ``item`` matches the :attr:`QUOTE_REGEX` pattern, then it will be
+        unquoted. Otherwise it's returned as-is.
+        """
+        result = self.QUOTE_REGEX.match(item)
+        if result:
+            return result.group('value')
+        return item
 
     def serialize(self, value):
+        """Serialize ``value`` into a multi-line string.
+
+        :param list value: the input list
+        :rtype: str
+        :raise ValueError: if ``value`` is the wrong type (i.e. not a list)
+        """
         if not isinstance(value, (list, set)):
             raise ValueError('ListAttribute value must be a list.')
-        return ','.join(value)
+        elif not value:
+            # return an empty string when there is no value
+            return ''
+
+        # we ensure to read a newline, even with only one value in the list
+        # this way, comma will be ignored when the configuration file
+        # is read again later
+        return '\n' + '\n'.join(self.serialize_item(item) for item in value)
+
+    def serialize_item(self, item):
+        """Serialize an ``item`` from the list value.
+
+        :param str item: one item of the list to serialize
+        :rtype: str
+
+        If ``item`` starts with a ``#`` it will be quoted in order to prevent
+        the config parser from thinking it's a comment.
+        """
+        if item.startswith('#'):
+            # we need to protect item that would otherwise appear as comment
+            return '"%s"' % item
+        return item
 
     def configure(self, prompt, default, parent, section_name):
+        """
+        With the ``prompt`` and ``default``, parse and return a value from
+        terminal.
+        """
         each_prompt = '?'
         if isinstance(prompt, tuple):
             each_prompt = prompt[1]
             prompt = prompt[0]
 
         if default is not NO_DEFAULT:
-            default = ','.join(default)
-            prompt = '{} [{}]'.format(prompt, default)
+            default_prompt = ','.join(['"{}"'.format(item) for item in default])
+            prompt = '{} [{}]'.format(prompt, default_prompt)
         else:
-            default = ''
+            default = []
         print(prompt)
         values = []
         value = get_input(each_prompt + ' ') or default
+        if (value == default) and not default:
+            value = ''
         while value:
-            values.append(value)
+            if value == default:
+                values.extend(value)
+            else:
+                values.append(value)
             value = get_input(each_prompt + ' ')
-        return self.parse(','.join(values))
+        return self.parse(self.serialize(values))
 
 
 class ChoiceAttribute(BaseValidated):
     """A config attribute which must be one of a set group of options.
 
-    Currently, the choices can only be strings."""
+    :param str name: the attribute name to use in the config file
+    :param choices: acceptable values; currently, only strings are supported
+    :type choices: list or tuple
+    :param default: which choice to use if none is set in the config file; to
+                    require explicit configuration, use
+                    :const:`sopel.config.types.NO_DEFAULT`
+    :type default: str, optional
+    """
     def __init__(self, name, choices, default=None):
         super(ChoiceAttribute, self).__init__(name, default=default)
         self.choices = choices
 
     def parse(self, value):
+        """Check the loaded ``value`` against the valid ``choices``.
+
+        :param str value: the value loaded from the config file
+        :return: the ``value``, if it is valid
+        :rtype: str
+        :raise ValueError: if ``value`` is not one of the valid ``choices``
+        """
         if value in self.choices:
             return value
         else:
             raise ValueError('Value must be in {}'.format(self.choices))
 
     def serialize(self, value):
+        """Make sure ``value`` is valid and safe to write in the config file.
+
+        :param str value: the value needing to be saved
+        :return: the ``value``, if it is valid
+        :rtype: str
+        :raise ValueError: if ``value`` is not one of the valid ``choices``
+        """
         if value in self.choices:
             return value
         else:
@@ -274,14 +471,21 @@ class ChoiceAttribute(BaseValidated):
 
 
 class FilenameAttribute(BaseValidated):
-    """A config attribute which must be a file or directory."""
+    """A config attribute which must be a file or directory.
+
+    :param str name: the attribute name to use in the config file
+    :param relative: whether the path should be relative to the location of
+                     the config file (absolute paths will still be absolute)
+    :type relative: bool, optional
+    :param directory: whether the path should indicate a directory, rather
+                      than a file
+    :type directory: bool, optional
+    :param default: the value to use if none is defined in the config file; to
+                    require explicit configuration, use
+                    :const:`sopel.config.types.NO_DEFAULT`
+    :type default: str, optional
+    """
     def __init__(self, name, relative=True, directory=False, default=None):
-        """
-        ``relative`` is whether the path should be relative to the location
-        of the config file (absolute paths will still be absolute). If
-        ``directory`` is True, the path must indicate a directory, rather than
-        a file.
-        """
         super(FilenameAttribute, self).__init__(name, default=default)
         self.relative = relative
         self.directory = directory
@@ -305,16 +509,18 @@ class FilenameAttribute(BaseValidated):
                 )
         main_config = instance._parent
         this_section = getattr(main_config, instance._section_name)
-        return self.parse(main_config, this_section, value)
+        return self.parse(value, main_config, this_section)
 
     def __set__(self, instance, value):
         main_config = instance._parent
         this_section = getattr(main_config, instance._section_name)
-        value = self.serialize(main_config, this_section, value)
+        value = self.serialize(value, main_config, this_section)
         instance._parser.set(instance._section_name, self.name, value)
 
     def configure(self, prompt, default, parent, section_name):
-        """With the prompt and default, parse and return a value from terminal.
+        """
+        With the ``prompt`` and ``default``, parse and return a value from
+        terminal.
         """
         if default is not NO_DEFAULT and default is not None:
             prompt = '{} [{}]'.format(prompt, default)
@@ -322,9 +528,19 @@ class FilenameAttribute(BaseValidated):
         if not value and default is NO_DEFAULT:
             raise ValueError("You must provide a value for this option.")
         value = value or default
-        return self.parse(parent, section_name, value)
+        return self.parse(value, parent, section_name)
 
-    def parse(self, main_config, this_section, value):
+    def parse(self, value, main_config, this_section):
+        """Used to validate ``value`` when loading the config.
+
+        :param main_config: the config object which contains this attribute
+        :type main_config: :class:`~sopel.config.Config`
+        :param this_section: the config section which contains this attribute
+        :type this_section: :class:`~StaticSection`
+        :return: the ``value``, if it is valid
+        :rtype: str
+        :raise ValueError: if the ``value`` is not valid
+        """
         if value is None:
             return
 
@@ -348,6 +564,16 @@ class FilenameAttribute(BaseValidated):
                 raise ValueError("Value must be an existing or creatable file.")
         return value
 
-    def serialize(self, main_config, this_section, value):
-        self.parse(main_config, this_section, value)
+    def serialize(self, value, main_config, this_section):
+        """Used to validate ``value`` when it is changed at runtime.
+
+        :param main_config: the config object which contains this attribute
+        :type main_config: :class:`~sopel.config.Config`
+        :param this_section: the config section which contains this attribute
+        :type this_section: :class:`~StaticSection`
+        :return: the ``value``, if it is valid
+        :rtype: str
+        :raise ValueError: if the ``value`` is not valid
+        """
+        self.parse(value, main_config, this_section)
         return value  # So that it's still relative

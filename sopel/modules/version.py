@@ -10,14 +10,11 @@ https://sopel.chat
 from __future__ import unicode_literals, absolute_import, print_function, division
 
 from datetime import datetime
-from sopel import __version__ as release
-from sopel.module import commands, intent, rate
-import re
 from os import path
 import platform
 
-
-log_line = re.compile(r'\S+ (\S+) (.*? <.*?>) (\d+) (\S+)\tcommit[^:]*: (.+)')
+from sopel import __version__ as release
+from sopel.module import commands, intent, rate
 
 
 def git_info():
@@ -39,13 +36,13 @@ def version(bot, trigger):
     """Display the latest commit version, if Sopel is running in a git repo."""
     sha = git_info()
     if not sha:
-        msg = 'Sopel v. ' + release + ' (Python {})'.format(platform.python_version())
+        msg = 'Sopel v' + release + ' (Python {})'.format(platform.python_version())
         if release[-4:] == '-git':
             msg += ' at unknown commit.'
         bot.reply(msg)
         return
 
-    bot.reply("Sopel v. {} (Python {}) at commit: {}".format(release, platform.python_version(), sha))
+    bot.reply("Sopel v{} (Python {}) at commit: {}".format(release, platform.python_version(), sha))
 
 
 @intent('VERSION')

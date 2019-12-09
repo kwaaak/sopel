@@ -10,37 +10,31 @@ https://sopel.chat
 """
 from __future__ import unicode_literals, absolute_import, print_function, division
 
+import argparse
+import logging
+import os
+import platform
+import signal
 import sys
+import time
 
-from sopel import tools
+from sopel import bot, config, logger, tools, __version__
+from . import utils
 
 if sys.version_info < (2, 7):
     tools.stderr('Error: Requires Python 2.7 or later. Try python2.7 sopel')
     sys.exit(1)
 if sys.version_info.major == 2:
-    tools.stderr('Warning: Python 2.x is near end of life. Sopel support at that point is TBD.')
+    if time.time() >= 1577836800:  # 2020-01-01 00:00:00 UTC
+        state = 'is near end of life'
+    else:
+        state = 'has reached end of life and will receive no further updates'
+    tools.stderr('Warning: Python 2.x %s. Sopel will drop support in version 8.0.' % state)
 if sys.version_info.major == 3 and sys.version_info.minor < 3:
     tools.stderr('Error: When running on Python 3, Python 3.3 is required.')
     sys.exit(1)
 
-import argparse
-import os
-import platform
-import signal
-import time
-import traceback
-
-from sopel import bot, logger, __version__
-from sopel.config import (
-    Config,
-    _create_config,
-    ConfigurationError,
-    ConfigurationNotFound,
-    DEFAULT_HOMEDIR,
-    _wizard
-)
-from . import utils
-
+LOGGER = logging.getLogger(__name__)
 
 ERR_CODE = 1
 """Error code: program exited with an error"""
@@ -52,24 +46,31 @@ encounters such an error case.
 """
 
 
-def run(config, pid_file, daemon=False):
+def run(settings, pid_file, daemon=False):
     delay = 20
-    # Inject ca_certs from config to web for SSL validation of web requests
-    if not config.core.ca_certs:
+
+    # Acts as a welcome message, showing the program and platform version at start
+    print_version()
+
+    if not settings.core.ca_certs:
         tools.stderr(
             'Could not open CA certificates file. SSL will not work properly!')
 
     def signal_handler(sig, frame):
         if sig == signal.SIGUSR1 or sig == signal.SIGTERM or sig == signal.SIGINT:
-            tools.stderr('Got quit signal, shutting down.')
+            LOGGER.warning('Got quit signal, shutting down.')
             p.quit('Closing')
         elif sig == signal.SIGUSR2 or sig == signal.SIGILL:
-            tools.stderr('Got restart signal.')
+            LOGGER.warning('Got restart signal, shutting down and restarting.')
             p.restart('Restarting')
 
+    # Define empty variable `p` for bot
+    p = None
     while True:
+        if p and p.hasquit:  # Check if `hasquit` was set for bot during disconnected phase
+            break
         try:
-            p = bot.Sopel(config, daemon=daemon)
+            p = bot.Sopel(settings, daemon=daemon)
             if hasattr(signal, 'SIGUSR1'):
                 signal.signal(signal.SIGUSR1, signal_handler)
             if hasattr(signal, 'SIGTERM'):
@@ -80,21 +81,27 @@ def run(config, pid_file, daemon=False):
                 signal.signal(signal.SIGUSR2, signal_handler)
             if hasattr(signal, 'SIGILL'):
                 signal.signal(signal.SIGILL, signal_handler)
-            logger.setup_logging(p)
-            p.run(config.core.host, int(config.core.port))
+            p.setup()
         except KeyboardInterrupt:
             break
-        except Exception:  # TODO: Be specific
-            trace = traceback.format_exc()
-            try:
-                tools.stderr(trace)
-            except Exception:  # TODO: Be specific
-                pass
-            logfile = open(os.path.join(config.core.logdir, 'exceptions.log'), 'a')
-            logfile.write('Critical exception in core')
-            logfile.write(trace)
-            logfile.write('----------------------------------------\n\n')
-            logfile.close()
+        except Exception:
+            # In that case, there is nothing we can do.
+            # If the bot can't setup itself, then it won't run.
+            # This is a critical case scenario, where the user should have
+            # direct access to the exception traceback right in the console.
+            # Besides, we can't know if logging has been set up or not, so
+            # we can't rely on that here.
+            tools.stderr('Unexpected error in bot setup')
+            raise
+
+        try:
+            p.run(settings.core.host, int(settings.core.port))
+        except KeyboardInterrupt:
+            break
+        except Exception:
+            err_log = logging.getLogger('sopel.exceptions')
+            err_log.exception('Critical exception in core')
+            err_log.error('----------------------------------------')
             # TODO: This should be handled by command_start
             # All we should need here is a return value, but replacing the
             # os._exit() call below (at the end) broke ^C.
@@ -109,8 +116,7 @@ def run(config, pid_file, daemon=False):
             return -1
         if p.hasquit:
             break
-        tools.stderr(
-            'Warning: Disconnected. Reconnecting in %s seconds...' % delay)
+        LOGGER.warning('Disconnected. Reconnecting in %s seconds...', delay)
         time.sleep(delay)
     # TODO: This should be handled by command_start
     # All we should need here is a return value, but making this
@@ -120,18 +126,24 @@ def run(config, pid_file, daemon=False):
 
 
 def add_legacy_options(parser):
+    # TL;DR: option -d/--fork is not deprecated.
+    # When the legacy action is replaced in Sopel 8, 'start' will become the
+    # new default action, with its arguments.
+    # The option -d/--fork is used by both actions (start and legacy),
+    # and it has the same meaning and behavior, therefore it is not deprecated.
     parser.add_argument("-d", '--fork', action="store_true",
-                        dest="daemonize", help="Daemonize Sopel")
+                        dest="daemonize",
+                        help="Daemonize Sopel.")
     parser.add_argument("-q", '--quit', action="store_true", dest="quit",
                         help=(
                             "Gracefully quit Sopel "
                             "(deprecated, and will be removed in Sopel 8; "
-                            "use `sopel stop` instead)"))
+                            "use ``sopel stop`` instead)"))
     parser.add_argument("-k", '--kill', action="store_true", dest="kill",
                         help=(
                             "Kill Sopel "
                             "(deprecated, and will be removed in Sopel 8; "
-                            "use `sopel stop --kill` instead)"))
+                            "use ``sopel stop --kill`` instead)"))
     parser.add_argument("-r", '--restart', action="store_true", dest="restart",
                         help=(
                             "Restart Sopel "
@@ -139,7 +151,10 @@ def add_legacy_options(parser):
                             "use `sopel restart` instead)"))
     parser.add_argument("-l", '--list', action="store_true",
                         dest="list_configs",
-                        help="List all config files found")
+                        help=(
+                            "List all config files found"
+                            "(deprecated, and will be removed in Sopel 8; "
+                            "use ``sopel-config list`` instead)"))
     parser.add_argument('--quiet', action="store_true", dest="quiet",
                         help="Suppress all output")
     parser.add_argument('-w', '--configure-all', action='store_true',
@@ -152,15 +167,15 @@ def add_legacy_options(parser):
                         dest='mod_wizard',
                         help=(
                             "Run the configuration wizard, but only for the "
-                            "module configuration options "
+                            "plugin configuration options "
                             "(deprecated, and will be removed in Sopel 8; "
-                            "use `sopel configure --modules` instead)"))
+                            "use ``sopel configure --plugins`` instead)"))
     parser.add_argument('-v', action="store_true",
                         dest='version_legacy',
                         help=(
                             "Show version number and exit "
                             "(deprecated, and will be removed in Sopel 8; "
-                            "use -V/--version instead)"))
+                            "use ``-V/--version`` instead)"))
     parser.add_argument('-V', '--version', action='store_true',
                         dest='version',
                         help='Show version number and exit')
@@ -174,27 +189,32 @@ def build_parser():
     utils.add_common_arguments(parser)
 
     subparsers = parser.add_subparsers(
-        title='sub-commands',
-        description='List of Sopel\'s sub-commands',
+        title='subcommands',
+        description='List of Sopel\'s subcommands',
         dest='action',
         metavar='{start,configure,stop,restart}')
 
-    # manage `legacy` sub-command
+    # manage `legacy` subcommand
     parser_legacy = subparsers.add_parser('legacy')
     add_legacy_options(parser_legacy)
     utils.add_common_arguments(parser_legacy)
 
-    # manage `start` sub-command
+    # manage `start` subcommand
     parser_start = subparsers.add_parser(
         'start',
-        description='Start a Sopel instance',
+        description='Start a Sopel instance. '
+                    'This command requires an existing configuration file '
+                    'that can be generated with ``sopel configure``.',
         help='Start a Sopel instance')
     parser_start.add_argument(
         '-d', '--fork',
         dest='daemonize',
         action='store_true',
         default=False,
-        help='Run Sopel as a daemon (fork)')
+        help='Run Sopel as a daemon (fork). This bot will safely run in the '
+             'background. The instance will be named after the name of the '
+             'configuration file used to run it. '
+             'To stop it, use ``sopel stop`` (with the same configuration).')
     parser_start.add_argument(
         '--quiet',
         action="store_true",
@@ -202,20 +222,32 @@ def build_parser():
         help="Suppress all output")
     utils.add_common_arguments(parser_start)
 
-    # manage `configure` sub-command
+    # manage `configure` subcommand
     parser_configure = subparsers.add_parser(
-        'configure', help='Sopel\'s Wizard tool')
+        'configure',
+        description='Run the configuration wizard. It can be used to create '
+                    'a new configuration file or to update an existing one.',
+        help='Sopel\'s Wizard tool')
     parser_configure.add_argument(
-        '--modules',
+        '--plugins',
         action='store_true',
         default=False,
-        dest='modules')
+        dest='plugins',
+        help='Check for Sopel plugins that require configuration, and run '
+             'their configuration wizards.')
     utils.add_common_arguments(parser_configure)
 
-    # manage `stop` sub-command
+    # manage `stop` subcommand
     parser_stop = subparsers.add_parser(
         'stop',
-        description='Stop a running Sopel instance',
+        description='Stop a running Sopel instance. '
+                    'This command determines the instance to quit by the name '
+                    'of the configuration file used ("default", or the one '
+                    'from the ``-c``/``--config`` option). '
+                    'This command should be used when the bot is running in '
+                    'the background from ``sopel start -d``, and should not '
+                    'be used when Sopel is managed by a process manager '
+                    '(like systemd or supervisor).',
         help='Stop a running Sopel instance')
     parser_stop.add_argument(
         '-k', '--kill',
@@ -229,7 +261,7 @@ def build_parser():
         help="Suppress all output")
     utils.add_common_arguments(parser_stop)
 
-    # manage `restart` sub-command
+    # manage `restart` subcommand
     parser_restart = subparsers.add_parser(
         'restart',
         description='Restart a running Sopel instance',
@@ -276,14 +308,14 @@ def print_version():
     print('https://sopel.chat/')
 
 
-def print_config():
-    """Print list of available configurations from default homedir."""
-    configs = utils.enumerate_configs(DEFAULT_HOMEDIR)
-    print('Config files in %s:' % DEFAULT_HOMEDIR)
-    config = None
-    for config in configs:
-        print('\t%s' % config)
-    if not config:
+def print_config(configdir):
+    """Print list of available configurations from config directory."""
+    configs = utils.enumerate_configs(configdir)
+    print('Config files in %s:' % configdir)
+    configfile = None
+    for configfile in configs:
+        print('\t%s' % configfile)
+    if not configfile:
         print('\tNone found')
 
     print('-------------------------')
@@ -308,23 +340,16 @@ def get_configuration(options):
 
     """
     try:
-        bot_config = utils.load_settings(options)
-    except ConfigurationNotFound as error:
+        settings = utils.load_settings(options)
+    except config.ConfigurationNotFound as error:
         print(
             "Welcome to Sopel!\n"
             "I can't seem to find the configuration file, "
             "so let's generate it!\n")
+        settings = utils.wizard(error.filename)
 
-        config_path = error.filename
-        if not config_path.endswith('.cfg'):
-            config_path = config_path + '.cfg'
-
-        config_path = _create_config(config_path)
-        # try to reload it now that it's created
-        bot_config = Config(config_path)
-
-    bot_config._is_daemonized = options.daemonize
-    return bot_config
+    settings._is_daemonized = options.daemonize
+    return settings
 
 
 def get_pid_filename(options, pid_dir):
@@ -339,7 +364,7 @@ def get_pid_filename(options, pid_dir):
     ``sopel-{basename}.pid`` instead.
     """
     name = 'sopel.pid'
-    if options.config:
+    if options.config and options.config != 'default':
         basename = os.path.basename(options.config)
         if basename.endswith('.cfg'):
             basename = basename[:-4]
@@ -374,7 +399,7 @@ def command_start(opts):
     # Step One: Get the configuration file and prepare to run
     try:
         config_module = get_configuration(opts)
-    except ConfigurationError as e:
+    except config.ConfigurationError as e:
         tools.stderr(e)
         return ERR_CODE_NO_RESTART
 
@@ -382,10 +407,7 @@ def command_start(opts):
         tools.stderr('Bot is not configured, can\'t start')
         return ERR_CODE_NO_RESTART
 
-    # Step Two: Manage logfile, stdout and stderr
-    utils.redirect_outputs(config_module, opts.quiet)
-
-    # Step Three: Handle process-lifecycle options and manage the PID file
+    # Step Two: Handle process-lifecycle options and manage the PID file
     pid_dir = config_module.core.pid_dir
     pid_file_path = get_pid_filename(opts, pid_dir)
     pid = get_running_pid(pid_file_path)
@@ -399,16 +421,16 @@ def command_start(opts):
 
     if opts.daemonize:
         child_pid = os.fork()
-        if child_pid is not 0:
+        if child_pid != 0:
             return
 
     with open(pid_file_path, 'w') as pid_file:
         pid_file.write(str(os.getpid()))
 
-    # Step Four: Run Sopel
+    # Step Three: Run Sopel
     ret = run(config_module, pid_file_path)
 
-    # Step Five: Shutdown Clean-Up
+    # Step Four: Shutdown Clean-Up
     os.unlink(pid_file_path)
 
     if ret == -1:
@@ -421,10 +443,11 @@ def command_start(opts):
 
 def command_configure(opts):
     """Sopel Configuration Wizard"""
-    if getattr(opts, 'modules', False):
-        _wizard('mod', opts.config)
+    configpath = utils.find_config(opts.configdir, opts.config)
+    if opts.plugins:
+        utils.plugins_wizard(configpath)
     else:
-        _wizard('all', opts.config)
+        utils.wizard(configpath)
 
 
 def command_stop(opts):
@@ -432,7 +455,7 @@ def command_stop(opts):
     # Get Configuration
     try:
         settings = utils.load_settings(opts)
-    except ConfigurationNotFound as error:
+    except config.ConfigurationNotFound as error:
         tools.stderr('Configuration "%s" not found' % error.filename)
         return ERR_CODE
 
@@ -440,8 +463,8 @@ def command_stop(opts):
         tools.stderr('Sopel is not configured, can\'t stop')
         return ERR_CODE
 
-    # Redirect Outputs
-    utils.redirect_outputs(settings, opts.quiet)
+    # Configure logging
+    logger.setup_logging(settings)
 
     # Get Sopel's PID
     filename = get_pid_filename(opts, settings.core.pid_dir)
@@ -471,7 +494,7 @@ def command_restart(opts):
     # Get Configuration
     try:
         settings = utils.load_settings(opts)
-    except ConfigurationNotFound as error:
+    except config.ConfigurationNotFound as error:
         tools.stderr('Configuration "%s" not found' % error.filename)
         return ERR_CODE
 
@@ -479,8 +502,8 @@ def command_restart(opts):
         tools.stderr('Sopel is not configured, can\'t stop')
         return ERR_CODE
 
-    # Redirect Outputs
-    utils.redirect_outputs(settings, opts.quiet)
+    # Configure logging
+    logger.setup_logging(settings)
 
     # Get Sopel's PID
     filename = get_pid_filename(opts, settings.core.pid_dir)
@@ -533,28 +556,33 @@ def command_legacy(opts):
         print_version()
         return
 
+    configpath = utils.find_config(opts.configdir, opts.config)
+
     if opts.wizard:
         tools.stderr(
             'WARNING: option -w/--configure-all is deprecated; '
             'use `sopel configure` instead')
-        _wizard('all', opts.config)
+        utils.wizard(configpath)
         return
 
     if opts.mod_wizard:
         tools.stderr(
             'WARNING: option --configure-modules is deprecated; '
-            'use `sopel configure --modules` instead')
-        _wizard('mod', opts.config)
+            'use `sopel configure --plugins` instead')
+        utils.plugins_wizard(configpath)
         return
 
     if opts.list_configs:
-        print_config()
+        tools.stderr(
+            'WARNING: option --list is deprecated; '
+            'use `sopel-config list` instead')
+        print_config(opts.configdir)
         return
 
     # Step Two: Get the configuration file and prepare to run
     try:
         config_module = get_configuration(opts)
-    except ConfigurationError as e:
+    except config.ConfigurationError as e:
         tools.stderr(e)
         return ERR_CODE_NO_RESTART
 
@@ -562,10 +590,7 @@ def command_legacy(opts):
         tools.stderr('Bot is not configured, can\'t start')
         return ERR_CODE_NO_RESTART
 
-    # Step Three: Manage logfile, stdout and stderr
-    utils.redirect_outputs(config_module, opts.quiet)
-
-    # Step Four: Handle process-lifecycle options and manage the PID file
+    # Step Three: Handle process-lifecycle options and manage the PID file
     pid_dir = config_module.core.pid_dir
     pid_file_path = get_pid_filename(opts, pid_dir)
     old_pid = get_running_pid(pid_file_path)
@@ -614,12 +639,12 @@ def command_legacy(opts):
 
     if opts.daemonize:
         child_pid = os.fork()
-        if child_pid is not 0:
+        if child_pid != 0:
             return
     with open(pid_file_path, 'w') as pid_file:
         pid_file.write(str(os.getpid()))
 
-    # Step Five: Initialize and run Sopel
+    # Step Four: Initialize and run Sopel
     ret = run(config_module, pid_file_path)
     os.unlink(pid_file_path)
     if ret == -1:
@@ -635,7 +660,7 @@ def main(argv=None):
         parser = build_parser()
 
         # make sure to have an action first (`legacy` by default)
-        # TODO: `start` should be the default in Sopel 8
+        # TODO: `start` should be the default in Sopel 8
         argv = argv or sys.argv[1:]
         if not argv:
             argv = ['legacy']

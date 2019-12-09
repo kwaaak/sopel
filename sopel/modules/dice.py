@@ -1,17 +1,17 @@
 # coding=utf-8
 """
-dice.py - Dice Module
+dice.py - Sopel Dice Module
 Copyright 2010-2013, Dimitri "Tyrope" Molenaars, TyRope.nl
 Copyright 2013, Ari Koivula, <ari@koivu.la>
 Licensed under the Eiffel Forum License 2.
 
-https://sopel.chat/
+https://sopel.chat
 """
 from __future__ import unicode_literals, absolute_import, print_function, division
 
+import operator
 import random
 import re
-import operator
 
 import sopel.module
 from sopel.tools.calculation import eval_equation
@@ -171,19 +171,20 @@ def _roll_dice(bot, dice_expression):
 @sopel.module.priority("medium")
 @sopel.module.example(".roll 3d1+1", 'You roll 3d1+1: (1+1+1)+1 = 4')
 @sopel.module.example(".roll 3d1v2+1", 'You roll 3d1v2+1: (1[+1+1])+1 = 2')
-@sopel.module.example(".roll 2d4", r'You roll 2d4: \(\d\+\d\) = \d', re=True)
+@sopel.module.example(".roll 2d4", r'You roll 2d4: \(\d\+\d\) = \d', re=True, user_help=True)
 @sopel.module.example(".roll 100d1", r'[^:]*: \(100x1\) = 100', re=True)
 @sopel.module.example(".roll 1001d1", 'I only have 1000 dice. =(')
 @sopel.module.example(".roll 1d1 + 1d1", 'You roll 1d1 + 1d1: (1) + (1) = 2')
 @sopel.module.example(".roll 1d1+1d1", 'You roll 1d1+1d1: (1)+(1) = 2')
+@sopel.module.example(".roll 1d6 # initiative", r'You roll 1d6: \(\d\) = \d', re=True)
 def roll(bot, trigger):
-    """.dice XdY[vZ][+N], rolls dice and reports the result.
+    """.dice XdY[vZ][+N][#COMMENT], rolls dice and reports the result.
 
     X is the number of dice. Y is the number of faces in the dice. Z is the
     number of lowest dice to be dropped from the result. N is the constant to
-    be applied to the end result.
+    be applied to the end result. Comment is for easily noting the purpose.
     """
-    # This regexp is only allowed to have one captured group, because having
+    # This regexp is only allowed to have one capture group, because having
     # more would alter the output of re.findall.
     dice_regexp = r"-?\d*[dD]-?\d+(?:[vV]-?\d+)?"
 
@@ -192,12 +193,14 @@ def roll(bot, trigger):
     # using string formatting, so %-characters must be escaped.
     if not trigger.group(2):
         return bot.reply("No dice to roll.")
-    arg_str = trigger.group(2)
-    dice_expressions = re.findall(dice_regexp, arg_str)
-    arg_str = arg_str.replace("%", "%%")
+    arg_str_raw = trigger.group(2).split("#", 1)[0].strip()
+    dice_expressions = re.findall(dice_regexp, arg_str_raw)
+    arg_str = arg_str_raw.replace("%", "%%")
     arg_str = re.sub(dice_regexp, "%s", arg_str)
 
-    f = lambda dice_expr: _roll_dice(bot, dice_expr)
+    def f(dice_expr):
+        return _roll_dice(bot, dice_expr)
+
     dice = list(map(f, dice_expressions))
 
     if None in dice:
@@ -221,56 +224,25 @@ def roll(bot, trigger):
     try:
         result = eval_equation(eval_str)
     except TypeError:
-        bot.reply("The type of this equation is, apparently, not a string. " +
-            "How did you do that, anyway?")
+        bot.reply(
+            "The type of this equation is, apparently, not a string. "
+            "How did you do that, anyway?"
+        )
     except ValueError:
         # As it seems that ValueError is raised if the resulting equation would
         # be too big, give a semi-serious answer to reflect on this.
         bot.reply("You roll %s: %s = very big" % (
-            trigger.group(2), pretty_str))
+            arg_str_raw, pretty_str))
         return
     except (SyntaxError, eval_equation.Error):
-        bot.reply("I don't know how to process that. " +
-            "Are the dice as well as the algorithms correct?")
+        bot.reply(
+            "I don't know how to process that. "
+            "Are the dice as well as the algorithms correct?"
+        )
         return
 
     bot.reply("You roll %s: %s = %d" % (
-        trigger.group(2), pretty_str, result))
-
-
-@sopel.module.commands("choice")
-@sopel.module.commands("ch")
-@sopel.module.commands("choose")
-@sopel.module.priority("medium")
-@sopel.module.example(".choose a, b, c", r'Your options: a, b, c. My choice: (a|b|c)', re=True)
-@sopel.module.example(".choose a | b | c", r'Your options: a, b, c. My choice: (a|b|c)', re=True)
-@sopel.module.example(".choose a,b,c", r'Your options: a, b, c. My choice: (a|b|c)', re=True)
-@sopel.module.example(".choose a|b|c", r'Your options: a, b, c. My choice: (a|b|c)', re=True)
-@sopel.module.example(".choose a b c", r'Your options: a, b, c. My choice: (a|b|c)', re=True)
-@sopel.module.example(".choose a, b | just a",
-                      r'Your options: "a, b", just a. My choice: ((a, b)|(just a))',
-                      re=True)
-@sopel.module.example(".choose a", 'Your options: a. My choice: a')
-def choose(bot, trigger):
-    """
-    .choice option1|option2|option3 - Makes a difficult choice easy.
-    """
-    if not trigger.group(2):
-        return bot.reply('I\'d choose an option, but you didn\'t give me any.')
-    choices = [trigger.group(2)]
-    for delim in '|\\/, ':
-        choices = trigger.group(2).split(delim)
-        if len(choices) > 1:
-            break
-    choices = [choice.strip() for choice in choices]
-    pick = random.choice(choices)
-
-    # Always use a comma in the output
-    display_options = ', '.join(
-        choice if ',' not in choice else '"%s"' % choice
-        for choice in choices
-    )
-    return bot.reply('Your options: %s. My choice: %s' % (display_options, pick))
+        arg_str_raw, pretty_str, result))
 
 
 if __name__ == "__main__":

@@ -10,9 +10,12 @@ https://sopel.chat
 from __future__ import unicode_literals, absolute_import, print_function, division
 
 from re import sub
+
 from requests import get
-from sopel import web
+
 from sopel.module import commands, example, NOLIMIT
+from sopel.tools import web
+
 try:
     # Python 2.7
     from HTMLParser import HTMLParser
@@ -36,6 +39,9 @@ ETYSEARCH = 'https://www.etymonline.com/search?q=%s'
 def etymology(word):
     # @@ <nsh> sbp, would it be possible to have a flag for .ety to get 2nd/etc
     # entries? - http://swhack.com/logs/2006-07-19#T15-05-29
+
+    if not word:
+        raise ValueError("No word to look for.")
 
     if len(word) > 25:
         raise ValueError("Word too long: %s[…]" % word[:10])
@@ -74,7 +80,7 @@ def f_etymology(bot, trigger):
         result = etymology(word)
     except IOError:
         msg = "Can't connect to etymonline.com (%s)" % (ETYURI % web.quote(word))
-        bot.msg(trigger.sender, msg)
+        bot.say(msg, trigger.sender)
         return NOLIMIT
     except (AttributeError, TypeError):
         result = None
@@ -82,9 +88,9 @@ def f_etymology(bot, trigger):
         result = str(ve)
 
     if result is not None:
-        bot.msg(trigger.sender, result)
+        bot.say(result, trigger.sender)
     else:
         uri = ETYSEARCH % web.quote(word)
         msg = 'Can\'t find the etymology for "%s". Try %s' % (word, uri)
-        bot.msg(trigger.sender, msg)
+        bot.say(msg, trigger.sender)
         return NOLIMIT

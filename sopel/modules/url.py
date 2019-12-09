@@ -1,22 +1,34 @@
 # coding=utf-8
-"""URL title module"""
-# Copyright 2010-2011, Michael Yanovich, yanovich.net, Kenneth Sham
-# Copyright 2012-2013 Elsie Powell
-# Copyright 2013      Lior Ramati (firerogue517@gmail.com)
-# Copyright © 2014 Elad Alfassa <elad@fedoraproject.org>
-# Licensed under the Eiffel Forum License 2.
+"""
+url.py - Sopel URL Title Module
+Copyright 2010-2011, Michael Yanovich (yanovich.net) & Kenneth Sham
+Copyright 2012-2013, Elsie Powell
+Copyright 2013, Lior Ramati <firerogue517@gmail.com>
+Copyright 2014, Elad Alfassa <elad@fedoraproject.org>
+Licensed under the Eiffel Forum License 2.
+
+https://sopel.chat
+"""
 from __future__ import unicode_literals, absolute_import, print_function, division
 
 import re
-from sopel import web, tools, __version__
-from sopel.module import commands, rule, example
-from sopel.config.types import ValidatedAttribute, ListAttribute, StaticSection
 
+import dns.resolver
+import ipaddress
 import requests
+
+from sopel import __version__, module, tools
+from sopel.config.types import ListAttribute, StaticSection, ValidatedAttribute
+from sopel.tools import web
+
+# Python3 vs Python2
+try:
+    from urllib.parse import urlparse
+except ImportError:
+    from urlparse import urlparse
 
 USER_AGENT = 'Sopel/{} (https://sopel.chat)'.format(__version__)
 default_headers = {'User-Agent': USER_AGENT}
-find_urls = None
 # These are used to clean up the title tag before actually parsing it. Not the
 # world's best way to do this, but it'll do for now.
 title_tag_data = re.compile('<(/?)title( [^>]+)?>', re.IGNORECASE)
@@ -39,6 +51,12 @@ class UrlSection(StaticSection):
     shorten_url_length = ValidatedAttribute(
         'shorten_url_length', int, default=0)
     """If greater than 0, the title fetcher will include a TinyURL version of links longer than this many characters."""
+    enable_private_resolution = ValidatedAttribute(
+        'enable_private_resolution', bool, default=False)
+    """Enable URL lookups for RFC1918 addresses"""
+    enable_dns_resolution = ValidatedAttribute(
+        'enable_dns_resolution', bool, default=False)
+    """Enable DNS resolution for all domains to validate if there are RFC1918 resolutions"""
 
 
 def configure(config):
@@ -48,6 +66,8 @@ def configure(config):
     | exclude | https?://git\\\\.io/.* | A list of regular expressions for URLs for which the title should not be shown. |
     | exclusion\\_char | ! | A character (or string) which, when immediately preceding a URL, will stop the URL's title from being shown. |
     | shorten\\_url\\_length | 72 | If greater than 0, the title fetcher will include a TinyURL version of links longer than this many characters. |
+    | enable\\_private\\_resolution | False | Enable URL lookups for RFC1918 addresses. |
+    | enable\\_dns\\_resolution | False | Enable DNS resolution for all domains to validate if there are RFC1918 resolutions. |
     """
     config.define_section('url', UrlSection)
     config.url.configure_setting(
@@ -64,11 +84,17 @@ def configure(config):
         ' shorter version of the URL in the title as a TinyURL link'
         ' (0 to disable)'
     )
+    config.url.configure_setting(
+        'enable_private_resolution',
+        'Enable URL lookups for RFC1918 addresses?'
+    )
+    config.url.configure_setting(
+        'enable_dns_resolution',
+        'Enable DNS resolution for all domains to validate if there are RFC1918 resolutions?'
+    )
 
 
 def setup(bot):
-    global find_urls
-
     bot.config.define_section('url', UrlSection)
 
     if bot.config.url.exclude:
@@ -80,7 +106,7 @@ def setup(bot):
     # callbacks list because 1, it's easier to deal with modules that are still
     # using this list, and not the newer callbacks list and 2, having a lambda
     # just to pass is kinda ugly.
-    if not bot.memory.contains('url_exclude'):
+    if 'url_exclude' not in bot.memory:
         bot.memory['url_exclude'] = regexes
     else:
         exclude = bot.memory['url_exclude']
@@ -89,36 +115,30 @@ def setup(bot):
         bot.memory['url_exclude'] = exclude
 
     # Ensure last_seen_url is in memory
-    if not bot.memory.contains('last_seen_url'):
+    if 'last_seen_url' not in bot.memory:
         bot.memory['last_seen_url'] = tools.SopelMemory()
 
-    def find_func(text, clean=False):
-        def trim_url(url):
-            # clean trailing sentence- or clause-ending punctuation
-            while url[-1] in '.,?!\'":;':
-                url = url[:-1]
-
-            # clean unmatched parentheses/braces/brackets
-            for (opener, closer) in [('(', ')'), ('[', ']'), ('{', '}'), ('<', '>')]:
-                if (url[-1] == closer) and (url.count(opener) < url.count(closer)):
-                    url = url[:-1]
-
-            return url
-
-        re_url = r'(?u)((?<!%s)(?:http|https|ftp)(?::\/\/\S+))'\
-            % (bot.config.url.exclusion_char)
-        r = re.compile(re_url, re.IGNORECASE)
-
-        urls = re.findall(r, text)
-        if clean:
-            urls = [trim_url(url) for url in urls]
-        return urls
-
-    find_urls = find_func
+    # Initialize shortened_urls as a dict if it doesn't exist.
+    if 'shortened_urls' not in bot.memory:
+        bot.memory['shortened_urls'] = tools.SopelMemory()
 
 
-@commands('title')
-@example('.title http://google.com', '[ Google ] - google.com')
+def shutdown(bot):
+    # Unset `url_exclude` and `last_seen_url`, but not `shortened_urls`;
+    # clearing `shortened_urls` will increase API calls. Leaving it in memory
+    # should not lead to unexpected behavior.
+    for key in ['url_exclude', 'last_seen_url']:
+        try:
+            del bot.memory[key]
+        except KeyError:
+            pass
+
+
+@module.commands('title')
+@module.example(
+    '.title https://www.google.com',
+    '[ Google ] - www.google.com',
+    online=True)
 def title_command(bot, trigger):
     """
     Show the title or URL information for the given URL, or the last URL seen
@@ -127,32 +147,26 @@ def title_command(bot, trigger):
     if not trigger.group(2):
         if trigger.sender not in bot.memory['last_seen_url']:
             return
-        matched = check_callbacks(bot, trigger,
-                                  bot.memory['last_seen_url'][trigger.sender],
-                                  True)
+        matched = check_callbacks(
+            bot, bot.memory['last_seen_url'][trigger.sender])
         if matched:
             return
         else:
             urls = [bot.memory['last_seen_url'][trigger.sender]]
     else:
-        urls = find_urls(trigger)
+        urls = web.search_urls(
+            trigger,
+            exclusion_char=bot.config.url.exclusion_char)
 
-    results = process_urls(bot, trigger, urls)
-    for title, domain, tinyurl in results[:4]:
+    for url, title, domain, tinyurl in process_urls(bot, trigger, urls):
         message = '[ %s ] - %s' % (title, domain)
         if tinyurl:
             message += ' ( %s )' % tinyurl
         bot.reply(message)
-
-    # Nice to have different failure messages for one-and-only requested URL
-    # failed vs. one-of-many failed.
-    if len(urls) == 1 and not results:
-        bot.reply('Sorry, fetching that title failed. Make sure the site is working.')
-    elif len(urls) > len(results):
-        bot.reply('I couldn\'t get all of the titles, but I fetched what I could!')
+        bot.memory['last_seen_url'][trigger.sender] = url
 
 
-@rule(r'(?u).*(https?://\S+).*')
+@module.rule(r'(?u).*(https?://\S+).*')
 def title_auto(bot, trigger):
     """
     Automatically show titles for URLs. For shortened URLs/redirects, find
@@ -167,20 +181,17 @@ def title_auto(bot, trigger):
         if bot.memory['safety_cache'][trigger]['positives'] > 1:
             return
 
-    urls = find_urls(trigger, clean=True)
-    if len(urls) == 0:
-        return
+    urls = web.search_urls(
+        trigger, exclusion_char=bot.config.url.exclusion_char, clean=True)
 
-    results = process_urls(bot, trigger, urls)
-    bot.memory['last_seen_url'][trigger.sender] = urls[-1]
-
-    for title, domain, tinyurl in results[:4]:
+    for url, title, domain, tinyurl in process_urls(bot, trigger, urls):
         message = '[ %s ] - %s' % (title, domain)
         if tinyurl:
             message += ' ( %s )' % tinyurl
         # Guard against responding to other instances of this bot.
         if message != trigger:
             bot.say(message)
+            bot.memory['last_seen_url'][trigger.sender] = url
 
 
 def process_urls(bot, trigger, urls):
@@ -188,59 +199,79 @@ def process_urls(bot, trigger, urls):
     For each URL in the list, ensure that it isn't handled by another module.
     If not, find where it redirects to, if anywhere. If that redirected URL
     should be handled by another module, dispatch the callback for it.
-    Return a list of (title, hostname) tuples for each URL which is not handled by
-    another module.
+    Return a list of (title, hostname) tuples for each URL which is not handled
+    by another module.
     """
-
-    results = []
     shorten_url_length = bot.config.url.shorten_url_length
     for url in urls:
-        if not url.startswith(bot.config.url.exclusion_char):
-            # Magic stuff to account for international domain names
+        # Exclude URLs that start with the exclusion char
+        if url.startswith(bot.config.url.exclusion_char):
+            continue
+
+        # Check the URL does not match an existing URL callback
+        if check_callbacks(bot, url):
+            continue
+
+        # Prevent private addresses from being queried if enable_private_resolution is False
+        if not bot.config.url.enable_private_resolution:
+            parsed = urlparse(url)
+            # Check if it's an address like http://192.168.1.1
             try:
-                url = web.iri_to_uri(url)
-            except Exception:  # TODO: Be specific
+                if ipaddress.ip_address(parsed.hostname).is_private or ipaddress.ip_address(parsed.hostname).is_loopback:
+                    continue
+            except ValueError:
                 pass
-            # First, check that the URL we got doesn't match
-            matched = check_callbacks(bot, trigger, url, False)
-            if matched:
-                continue
-            # If the URL is over bot.config.url.shorten_url_length,
-            # shorten the URL
-            tinyurl = None
-            if (shorten_url_length > 0) and (len(url) > shorten_url_length):
-                # Check bot memory to see if the shortened URL is already in
-                # memory
-                if not bot.memory.contains('shortened_urls'):
-                    # Initialize shortened_urls as a dict if it doesn't exist.
-                    bot.memory['shortened_urls'] = tools.SopelMemory()
-                if bot.memory['shortened_urls'].contains(url):
-                    tinyurl = bot.memory['shortened_urls'][url]
-                else:
-                    tinyurl = get_tinyurl(url)
-                    bot.memory['shortened_urls'][url] = tinyurl
-            # Finally, actually show the URL
-            title = find_title(url, verify=bot.config.core.verify_ssl)
-            if title:
-                results.append((title, get_hostname(url), tinyurl))
-    return results
+
+            # Check if domains are RFC1918 addresses if enable_dns_resolutions is set
+            if bot.config.url.enable_dns_resolution:
+                private = False
+                for result in dns.resolver.query(parsed.hostname):
+                    if ipaddress.ip_address(result).is_private or ipaddress.ip_address(parsed.hostname).is_loopback:
+                        private = True
+                        break
+                if private:
+                    continue
+
+        # Call the URL to get a title, if possible
+        title = find_title(url)
+        if not title:
+            # No title found: don't handle this URL
+            continue
+
+        # If the URL is over bot.config.url.shorten_url_length, shorten the URL
+        tinyurl = None
+        if (shorten_url_length > 0) and (len(url) > shorten_url_length):
+            tinyurl = get_or_create_shorturl(bot, url)
+
+        yield (url, title, get_hostname(url), tinyurl)
 
 
-def check_callbacks(bot, trigger, url, run=True):
-    """
-    Check the given URL against the callbacks list. If it matches, and ``run``
-    is given as ``True``, run the callback function, otherwise pass. Returns
-    ``True`` if the url matched anything in the callbacks list.
+def check_callbacks(bot, url):
+    """Check if ``url`` is excluded or matches any URL callback patterns.
+
+    :param bot: Sopel instance
+    :param str url: URL to check
+    :return: True if ``url`` is excluded or matches any URL Callback pattern
+
+    This function looks at the ``bot.memory`` for ``url_exclude`` patterns and
+    it returns ``True`` if any matches the given ``url``. Otherwise, it looks
+    at the ``bot``'s URL Callback patterns, and it returns ``True`` if any
+    matches, ``False`` otherwise.
+
+    .. seealso::
+
+        The :func:`~sopel.modules.url.setup` function that defines the
+        ``url_exclude`` in ``bot.memory``.
+
+    .. versionchanged:: 7.0
+
+        This function **does not** trigger URL callbacks anymore when ``url``
+        matches a pattern.
+
     """
     # Check if it matches the exclusion list first
     matched = any(regex.search(url) for regex in bot.memory['url_exclude'])
-    # Then, check if there's anything in the callback list
-    for function, match in bot.search_url_callbacks(url):
-        # Always run ones from @url; they don't run on their own.
-        if run or hasattr(function, 'url_regex'):
-            function(bot, trigger, match)
-        matched = True
-    return matched
+    return matched or any(bot.search_url_callbacks(url))
 
 
 def find_title(url, verify=True):
@@ -293,9 +324,32 @@ def get_hostname(url):
     return hostname
 
 
+def get_or_create_shorturl(bot, url):
+    """Get or create a short URL for ``url``
+
+    :param bot: Sopel instance
+    :param str url: URL to get or create a short URL for
+    :return: A short URL
+    :rtype: str
+
+    It gets the short URL for ``url`` from the bot's memory if it exists.
+    Otherwise, it creates a short URL (see :func:`get_tinyurl`), stores it
+    into the bot's memory, then returns it.
+    """
+    # Check bot memory to see if the shortened URL is already in
+    # memory
+    if url in bot.memory['shortened_urls']:
+        return bot.memory['shortened_urls'][url]
+
+    tinyurl = get_tinyurl(url)
+    bot.memory['shortened_urls'][url] = tinyurl
+    return tinyurl
+
+
 def get_tinyurl(url):
-    """ Returns a shortened tinyURL link of the URL. """
-    tinyurl = "https://tinyurl.com/api-create.php?url=%s" % url
+    """Returns a shortened tinyURL link of the URL"""
+    base_url = "https://tinyurl.com/api-create.php"
+    tinyurl = "%s?%s" % (base_url, web.urlencode({'url': url}))
     try:
         res = requests.get(tinyurl)
         res.raise_for_status()

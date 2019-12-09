@@ -12,8 +12,26 @@
 
 from __future__ import unicode_literals, absolute_import, print_function, division
 
+from collections import namedtuple
 import locale
+import pkg_resources
+import re
 import sys
+
+__all__ = [
+    'bot',
+    'config',
+    'db',
+    'formatting',
+    'irc',
+    'loader',
+    'logger',
+    'module',
+    'tools',
+    'trigger',
+    'version_info',
+]
+
 loc = locale.getlocale()
 if sys.version_info.major > 2:
     if not loc[1] or 'UTF-8' not in loc[1]:
@@ -23,10 +41,7 @@ if sys.version_info.major > 2:
               'something like "en_US.UTF-8".', file=sys.stderr)
 
 
-from collections import namedtuple
-import re
-
-__version__ = '6.6.5'
+__version__ = pkg_resources.get_distribution('sopel').version
 
 
 def _version_info(version=__version__):

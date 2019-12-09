@@ -1,12 +1,8 @@
 # coding=utf-8
-"""This module has classes and functions that can help in writing tests.
-
-test_tools.py - Sopel misc tools
-Copyright 2013, Ari Koivula, <ari@koivu.la>
-Licensed under the Eiffel Forum License 2.
-
-https://sopel.chat
-"""
+"""This module has classes and functions that can help in writing tests."""
+# Copyright 2013, Ari Koivula, <ari@koivu.la>
+# Copyright 2019, Florian Strzelecki <florian.strzelecki@gmail.com>
+# Licensed under the Eiffel Forum License 2.
 from __future__ import unicode_literals, absolute_import, print_function, division
 
 import os
@@ -19,11 +15,24 @@ try:
 except ImportError:
     import configparser as ConfigParser
 
+from sopel.bot import SopelWrapper
 import sopel.config
 import sopel.config.core_section
+import sopel.plugins
 import sopel.tools
+import sopel.tools.target
 import sopel.trigger
 
+
+__all__ = [
+    'MockConfig',
+    'MockSopel',
+    'MockSopelWrapper',
+    'get_example_test',
+    'get_disable_setup',
+    'insert_into_module',
+    'run_example_tests',
+]
 
 if sys.version_info.major >= 3:
     basestring = str
@@ -32,8 +41,6 @@ if sys.version_info.major >= 3:
 class MockConfig(sopel.config.Config):
     def __init__(self):
         self.filename = tempfile.mkstemp()[1]
-        #self._homedir = tempfile.mkdtemp()
-        #self.filename = os.path.join(self._homedir, 'test.cfg')
         self.parser = ConfigParser.RawConfigParser(allow_no_value=True)
         self.parser.add_section('core')
         self.parser.set('core', 'owner', 'Embolalia')
@@ -55,20 +62,26 @@ class MockSopel(object):
         self.channels = sopel.tools.SopelMemory()
         self.channels[channel] = sopel.tools.target.Channel(channel)
 
+        self.users = sopel.tools.SopelMemory()
+        self.privileges = sopel.tools.SopelMemory()
+
         self.memory = sopel.tools.SopelMemory()
         self.memory['url_callbacks'] = sopel.tools.SopelMemory()
 
-        self.ops = {}
-        self.halfplus = {}
-        self.voices = {}
-
         self.config = MockConfig()
         self._init_config()
+
+        self.output = []
 
         if admin:
             self.config.core.admins = [self.nick]
         if owner:
             self.config.core.owner = self.nick
+
+    def _store(self, string, *args, **kwargs):
+        self.output.append(string.strip())
+
+    write = msg = say = notice = action = reply = _store
 
     def _init_config(self):
         cfg = self.config
@@ -101,39 +114,29 @@ class MockSopel(object):
                 yield function, match
 
 
-class MockSopelWrapper(object):
-    def __init__(self, bot, pretrigger):
-        self.bot = bot
-        self.pretrigger = pretrigger
-        self.output = []
-
-    def _store(self, string, recipent=None):
-        self.output.append(string.strip())
-
-    say = reply = action = _store
-
-    def __getattr__(self, attr):
-        return getattr(self.bot, attr)
+class MockSopelWrapper(SopelWrapper):
+    pass
 
 
 def get_example_test(tested_func, msg, results, privmsg, admin,
                      owner, repeat, use_regexp, ignore=[]):
-    """Get a function that calls tested_func with fake wrapper and trigger.
+    """Get a function that calls ``tested_func`` with fake wrapper and trigger.
 
-    Args:
-        tested_func - A sopel callable that accepts SopelWrapper and Trigger.
-        msg - Message that is supposed to trigger the command.
-        results - Expected output from the callable.
-        privmsg - If true, make the message appear to have sent in a private
-            message to the bot. If false, make it appear to have come from a
-            channel.
-        admin - If true, make the message appear to have come from an admin.
-        owner - If true, make the message appear to have come from an owner.
-        repeat - How many times to repeat the test. Useful for tests that
-            return random stuff.
-        use_regexp = Bool. If true, results is in regexp format.
-        ignore - List of strings to ignore.
-
+    :param callable tested_func: a Sopel callable that accepts a
+                                 ``SopelWrapper`` and a ``Trigger``
+    :param str msg: message that is supposed to trigger the command
+    :param list results: expected output from the callable
+    :param bool privmsg: if ``True``, make the message appear to have arrived
+                         in a private message to the bot; otherwise make it
+                         appear to have come from a channel
+    :param bool admin: make the message appear to have come from an admin
+    :param bool owner: make the message appear to have come from an owner
+    :param int repeat: how many times to repeat the test; useful for tests that
+                       return random stuff
+    :param bool use_regexp: pass ``True`` if ``results`` are in regexp format
+    :param list ignore: strings to ignore
+    :return: a test function for ``tested_func``
+    :rtype: ``callable``
     """
     def test():
         bot = MockSopel("NickName", admin=admin, owner=owner)
@@ -166,11 +169,13 @@ def get_example_test(tested_func, msg, results, privmsg, admin,
                     return False
             return True
 
+        expected_output_count = 0
         for _i in range(repeat):
+            expected_output_count += len(results)
             wrapper = MockSopelWrapper(bot, trigger)
             tested_func(wrapper, trigger)
             wrapper.output = list(filter(isnt_ignored, wrapper.output))
-            assert len(wrapper.output) == len(results)
+            assert len(wrapper.output) == expected_output_count
             for result, output in zip(results, wrapper.output):
                 if type(output) is bytes:
                     output = output.decode('utf-8')

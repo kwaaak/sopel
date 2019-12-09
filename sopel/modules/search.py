@@ -1,23 +1,21 @@
 # coding=utf-8
-# Copyright 2008-9, Sean B. Palmer, inamidst.com
-# Copyright 2012, Elsie Powell, embolalia.com
-# Licensed under the Eiffel Forum License 2.
+"""
+search.py - Sopel Search Engine Module
+Copyright 2008-9, Sean B. Palmer, inamidst.com
+Copyright 2012, Elsie Powell, embolalia.com
+Licensed under the Eiffel Forum License 2.
+
+https://sopel.chat
+"""
 from __future__ import unicode_literals, absolute_import, print_function, division
 
 import re
-import sys
-
-if sys.version_info.major < 3:
-    from urllib import unquote as _unquote
-    unquote = lambda s: _unquote(s.encode('utf-8')).decode('utf-8')
-else:
-    from urllib.parse import unquote
 
 import requests
 import xmltodict
 
-from sopel import web
 from sopel.module import commands, example
+from sopel.tools import web
 
 
 def formatnumber(n):
@@ -61,8 +59,7 @@ def duck_search(query):
         bytes = bytes.split('web-result')[1]
     m = r_duck.search(bytes)
     if m:
-        unquoted_m = unquote(m.group(1))
-        return web.decode(unquoted_m)
+        return web.decode(m.group(1))
 
 
 # Alias google_search to duck_search
@@ -92,11 +89,18 @@ def duck_api(query):
 
 @commands('duck', 'ddg', 'g')
 # test for bad Unicode handling in py2
-@example('.duck grandorder.wiki chulainn alter', 'https://grandorder.wiki/Cú_Chulainn_(Alter)')
-# the last example is what .help displays
-@example('.duck sopel irc bot', r'https?:\/\/sopel\.chat\/?', re=True)
+@example(
+    '.duck grandorder.wiki chulainn alter',
+    r'https://grandorder.wiki/C%C3%BA_Chulainn_(Alter)',
+    online=True)
+# the last example (in source line order) is what .help displays
+@example(
+    '.duck sopel.chat irc bot',
+    r'https?:\/\/sopel\.chat\/?',
+    re=True,
+    online=True)
 def duck(bot, trigger):
-    """Queries Duck Duck Go for the specified input."""
+    """Queries DuckDuckGo for the specified input."""
     query = trigger.group(2)
     if not query:
         return bot.reply('.ddg what?')
@@ -107,7 +111,7 @@ def duck(bot, trigger):
         bot.reply(result)
         return
 
-    # Otherwise, look it up on the HTMl version
+    # Otherwise, look it up on the HTML version
     uri = duck_search(query)
 
     if uri:
@@ -140,7 +144,7 @@ def bing(bot, trigger):
 @commands('search')
 @example('.search sopel irc bot')
 def search(bot, trigger):
-    """Searches Bing and Duck Duck Go."""
+    """Searches both Bing and DuckDuckGo."""
     if not trigger.group(2):
         return bot.reply('.search for what?')
     query = trigger.group(2)
@@ -160,11 +164,11 @@ def search(bot, trigger):
 
 
 @commands('suggest')
-@example('.suggest wikip', 'wikipedia')
-@example('.suggest ', 'No query term.')
-@example('.suggest lkashdfiauwgeaef', 'Sorry, no result.')
+@example('.suggest wikip', 'wikipedia', online=True)
+@example('.suggest ', 'No query term.', online=True)
+@example('.suggest lkashdfiauwgeaef', 'Sorry, no result.', online=True)
 def suggest(bot, trigger):
-    """Suggest terms starting with given input"""
+    """Suggests terms starting with given input"""
     if not trigger.group(2):
         return bot.reply("No query term.")
     query = trigger.group(2)

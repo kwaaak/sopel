@@ -8,9 +8,36 @@
 
 from __future__ import unicode_literals, absolute_import, print_function, division
 
-import re
-import sopel.test_tools
 import functools
+import re
+
+__all__ = [
+    # constants
+    'NOLIMIT', 'VOICE', 'HALFOP', 'OP', 'ADMIN', 'OWNER',
+    # decorators
+    'action_commands',
+    'commands',
+    'echo',
+    'event',
+    'example',
+    'intent',
+    'interval',
+    'nickname_commands',
+    'output_prefix',
+    'priority',
+    'rate',
+    'require_account',
+    'require_admin',
+    'require_chanmsg',
+    'require_owner',
+    'require_privilege',
+    'require_privmsg',
+    'rule',
+    'thread',
+    'unblockable',
+    'url',
+]
+
 
 NOLIMIT = 1
 """Return value for ``callable``\\s, which suppresses rate limiting for the call.
@@ -54,15 +81,30 @@ OWNER = 16
 
 
 def unblockable(function):
-    """Decorator which exempts the function from nickname and hostname blocking.
+    """Decorator to exempt ``function`` from nickname and hostname blocking.
 
-    This can be used to ensure events such as JOIN are always recorded.
+    This can be used to ensure events such as ``JOIN`` are always recorded::
+
+        from sopel import module
+
+        @module.event('JOIN')
+        @module.unblockable
+        def on_join_callable(bot, trigger):
+            # do something when a user JOIN a channel
+            # a blocked nickname or hostname *will* trigger this
+            pass
+
+    .. seealso::
+
+        Sopel's :meth:`~sopel.bot.Sopel.dispatch` and
+        :meth:`~sopel.bot.Sopel.get_triggered_callables` methods.
+
     """
     function.unblockable = True
     return function
 
 
-def interval(*args):
+def interval(*intervals):
     """Decorates a function to be called by the bot every X seconds.
 
     This decorator can be used multiple times for multiple intervals, or all
@@ -77,32 +119,33 @@ def interval(*args):
     There is no guarantee that the bot is connected to a server or joined a
     channel when the function is called, so care must be taken.
 
-    Example:::
+    Example::
 
-        import sopel.module
-        @sopel.module.interval(5)
+        from sopel import module
+
+        @module.interval(5)
         def spam_every_5s(bot):
             if "#here" in bot.channels:
-                bot.msg("#here", "It has been five seconds!")
+                bot.say("It has been five seconds!", "#here")
 
     """
     def add_attribute(function):
         if not hasattr(function, "interval"):
             function.interval = []
-        for arg in args:
-            function.interval.append(arg)
+        for arg in intervals:
+            if arg not in function.interval:
+                function.interval.append(arg)
         return function
 
     return add_attribute
 
 
-def rule(value):
+def rule(*patterns):
     """Decorate a function to be called when a line matches the given pattern
 
-    This decorator can be used multiple times to add more rules.
+    Each argument is a regular expression which will trigger the function.
 
-    Args:
-        value: A regular expression which will trigger the function.
+    This decorator can be used multiple times to add more rules.
 
     If the Sopel instance is in a channel, or sent a PRIVMSG, where a string
     matching this expression is said, the function will execute. Note that
@@ -111,11 +154,20 @@ def rule(value):
     Inside the regular expression, some special directives can be used. $nick
     will be replaced with the nick of the bot and , or :, and $nickname will be
     replaced with the nick of the bot.
+
+    .. versionchanged:: 7.0
+
+        The :func:`rule` decorator can be called with multiple positional
+        arguments, each used to add a rule. This is equivalent to decorating
+        the same function multiple times with this decorator.
+
     """
     def add_attribute(function):
         if not hasattr(function, "rule"):
             function.rule = []
-        function.rule.append(value)
+        for value in patterns:
+            if value not in function.rule:
+                function.rule.append(value)
         return function
 
     return add_attribute
@@ -124,19 +176,36 @@ def rule(value):
 def thread(value):
     """Decorate a function to specify if it should be run in a separate thread.
 
+    :param bool value: if true, the function is called in a separate thread;
+                       otherwise from the bot's main thread
+
     Functions run in a separate thread (as is the default) will not prevent the
     bot from executing other functions at the same time. Functions not run in a
     separate thread may be started while other functions are still running, but
     additional functions will not start until it is completed.
+    """
+    threaded = bool(value)
 
-    Args:
-        value: Either True or False. If True the function is called in
-            a separate thread. If False from the main thread.
+    def add_attribute(function):
+        function.thread = threaded
+        return function
 
+    return add_attribute
+
+
+def echo(function=None):
+    """Decorate a function to specify if it should receive echo messages.
+
+    This decorator can be used to listen in on the messages that Sopel is
+    sending and react accordingly.
     """
     def add_attribute(function):
-        function.thread = value
+        function.echo = True
         return function
+
+    # hack to allow both @echo and @echo() to work
+    if callable(function):
+        return add_attribute(function)
     return add_attribute
 
 
@@ -168,7 +237,9 @@ def commands(*command_list):
     def add_attribute(function):
         if not hasattr(function, "commands"):
             function.commands = []
-        function.commands.extend(command_list)
+        for command in command_list:
+            if command not in function.commands:
+                function.commands.append(command)
         return function
     return add_attribute
 
@@ -200,7 +271,41 @@ def nickname_commands(*command_list):
 
     """
     def add_attribute(function):
-        function.nickname_commands = [cmd for cmd in command_list]
+        if not hasattr(function, 'nickname_commands'):
+            function.nickname_commands = []
+        for cmd in command_list:
+            if cmd not in function.nickname_commands:
+                function.nickname_commands.append(cmd)
+        return function
+    return add_attribute
+
+
+def action_commands(*command_list):
+    """Decorate a function to trigger on CTCP ACTION lines.
+
+    This decorator can be used multiple times to add multiple rules. The
+    resulting match object will have the command as the first group, rest of
+    the line, excluding leading whitespace, as the second group. Parameters 1
+    through 4, separated by whitespace, will be groups 3-6.
+
+    Args:
+        command: A string, which can be a regular expression.
+
+    Returns:
+        A function with a new regular expression appended to the rule
+        attribute. If there is no rule attribute, it is added.
+
+    Example:
+        @action_commands("hello!"):
+            Would trigger on "/me hello!"
+    """
+    def add_attribute(function):
+        function.intents = ['ACTION']
+        if not hasattr(function, 'action_commands'):
+            function.action_commands = []
+        for cmd in command_list:
+            if cmd not in function.action_commands:
+                function.action_commands.append(cmd)
         return function
     return add_attribute
 
@@ -227,9 +332,9 @@ def event(*event_list):
 
     This is one of a number of events, such as 'JOIN', 'PART', 'QUIT', etc.
     (More details can be found in RFC 1459.) When the Sopel bot is sent one of
-    these events, the function will execute. Note that functions with an event
-    must also be given a rule to match (though it may be '.*', which will
-    always match) or they will not be triggered.
+    these events, the function will execute. Note that the default
+    :meth:`rule` (``.*``) will match *any* line of the correct event type(s).
+    If any rule is explicitly specified, it overrides the default.
 
     :class:`sopel.tools.events` provides human-readable names for many of the
     numeric events, which may help your code be clearer.
@@ -237,7 +342,9 @@ def event(*event_list):
     def add_attribute(function):
         if not hasattr(function, "event"):
             function.event = []
-        function.event.extend(event_list)
+        for name in event_list:
+            if name not in function.event:
+                function.event.append(name)
         return function
     return add_attribute
 
@@ -250,7 +357,9 @@ def intent(*intent_list):
     def add_attribute(function):
         if not hasattr(function, "intents"):
             function.intents = []
-        function.intents.extend(intent_list)
+        for name in intent_list:
+            if name not in function.intents:
+                function.intents.append(name)
         return function
     return add_attribute
 
@@ -274,56 +383,141 @@ def rate(user=0, channel=0, server=0):
     return add_attribute
 
 
-def require_privmsg(message=None):
+def require_privmsg(message=None, reply=False):
     """Decorate a function to only be triggerable from a private message.
 
-    If it is triggered in a channel message, `message` will be said if given.
+    :param str message: optional message said if triggered in a channel
+    :param bool reply: use :meth:`~sopel.bot.Sopel.reply` instead of
+                       :meth:`~sopel.bot.Sopel.say` when ``True``; defaults to
+                       ``False``
+
+    If it is triggered in a channel message, ``message`` will be said if
+    given. By default, it uses :meth:`bot.say() <.bot.Sopel.say>`, but when
+    ``reply`` is true, then it     uses :meth:`bot.reply() <.bot.Sopel.reply>`
+    instead.
+
+    .. versionchanged:: 7.0.0
+        Added the ``reply`` parameter.
     """
     def actual_decorator(function):
         @functools.wraps(function)
-        def _nop(*args, **kwargs):
-            # Assign trigger and bot for easy access later
-            bot, trigger = args[0:2]
+        def guarded(bot, trigger, *args, **kwargs):
             if trigger.is_privmsg:
-                return function(*args, **kwargs)
+                return function(bot, trigger, *args, **kwargs)
             else:
                 if message and not callable(message):
-                    bot.say(message)
-        return _nop
+                    if reply:
+                        bot.reply(message)
+                    else:
+                        bot.say(message)
+        return guarded
+
     # Hack to allow decorator without parens
     if callable(message):
         return actual_decorator(message)
     return actual_decorator
 
 
-def require_chanmsg(message=None):
+def require_chanmsg(message=None, reply=False):
     """Decorate a function to only be triggerable from a channel message.
 
-    If it is triggered in a private message, `message` will be said if given.
+    :param str message: optional message said if triggered in private message
+    :param bool reply: use :meth:`~.bot.Sopel.reply` instead of
+                       :meth:`~.bot.Sopel.say` when ``True``; defaults to
+                       ``False``
+
+    If it is triggered in a private message, ``message`` will be said if
+    given. By default, it uses :meth:`bot.say() <.bot.Sopel.say>`, but when
+    ``reply`` is true, then it uses :meth:`bot.reply() <.bot.Sopel.reply>`
+    instead.
+
+    .. versionchanged:: 7.0.0
+        Added the ``reply`` parameter.
     """
     def actual_decorator(function):
         @functools.wraps(function)
-        def _nop(*args, **kwargs):
-            # Assign trigger and bot for easy access later
-            bot, trigger = args[0:2]
+        def guarded(bot, trigger, *args, **kwargs):
             if not trigger.is_privmsg:
-                return function(*args, **kwargs)
+                return function(bot, trigger, *args, **kwargs)
             else:
                 if message and not callable(message):
-                    bot.say(message)
-        return _nop
+                    if reply:
+                        bot.reply(message)
+                    else:
+                        bot.say(message)
+        return guarded
+
     # Hack to allow decorator without parens
     if callable(message):
         return actual_decorator(message)
     return actual_decorator
 
 
-def require_privilege(level, message=None):
+def require_account(message=None, reply=False):  # lgtm [py/similar-function]
+    """Decorate a function to require services/NickServ authentication.
+
+    :param str message: optional message to say if a user without
+                        authentication tries to trigger this function
+    :param bool reply: use :meth:`~.bot.Sopel.reply` instead of
+                       :meth:`~.bot.Sopel.say` when ``True``; defaults to
+                       ``False``
+
+    .. versionadded:: 7.0.0
+    .. note::
+
+        Only some networks support services authentication, and not all of
+        those implement the standards required for clients like Sopel to
+        determine authentication status. This decorator will block *all* use
+        of functions it decorates on networks that lack the relevant features.
+
+    .. seealso::
+
+        The value of the :class:`trigger<.trigger.Trigger>`'s
+        :meth:`account<.trigger.Trigger.account>` property determines whether
+        this requirement is satisfied, and the property's documentation
+        includes up-to-date details on what features a network must
+        support to allow Sopel to fetch account information.
+    """
+    def actual_decorator(function):
+        @functools.wraps(function)
+        def guarded(bot, trigger, *args, **kwargs):
+            if not trigger.account:
+                if message and not callable(message):
+                    if reply:
+                        bot.reply(message)
+                    else:
+                        bot.say(message)
+            else:
+                return function(bot, trigger, *args, **kwargs)
+        return guarded
+
+    # Hack to allow decorator without parens
+    if callable(message):
+        return actual_decorator(message)
+
+    return actual_decorator
+
+
+def require_privilege(level, message=None, reply=False):
     """Decorate a function to require at least the given channel permission.
 
-    `level` can be one of the privilege levels defined in this module. If the
-    user does not have the privilege, `message` will be said if given. If it is
-    a private message, no checking will be done."""
+    :param int level: required privilege level to use this command
+    :param str message: optional message said to insufficiently privileged user
+    :param bool reply: use :meth:`~.bot.Sopel.reply` instead of
+                       :meth:`~.bot.Sopel.say` when ``True``; defaults to
+                       ``False``
+
+    ``level`` can be one of the privilege level constants defined in this
+    module. If the user does not have the privilege, the bot will say
+    ``message`` if given. By default, it uses :meth:`bot.say()
+    <.bot.Sopel.say>`, but when ``reply`` is true, then it uses
+    :meth:`bot.reply() <.bot.Sopel.reply>` instead.
+
+    Privilege requirements are ignored in private messages.
+
+    .. versionchanged:: 7.0.0
+        Added the ``reply`` parameter.
+    """
     def actual_decorator(function):
         @functools.wraps(function)
         def guarded(bot, trigger, *args, **kwargs):
@@ -334,22 +528,31 @@ def require_privilege(level, message=None):
             allowed = channel_privs.get(trigger.nick, 0) >= level
             if not trigger.is_privmsg and not allowed:
                 if message and not callable(message):
-                    bot.say(message)
+                    if reply:
+                        bot.reply(message)
+                    else:
+                        bot.say(message)
             else:
                 return function(bot, trigger, *args, **kwargs)
         return guarded
     return actual_decorator
 
 
-def require_admin(message=None, reply=False):
+def require_admin(message=None, reply=False):  # lgtm [py/similar-function]
     """Decorate a function to require the triggering user to be a bot admin.
 
     :param str message: optional message said to non-admin user
-    :param bool reply: use `reply` instead of `say` when true, default to false
+    :param bool reply: use :meth:`~.bot.Sopel.reply` instead of
+                       :meth:`~.bot.Sopel.say` when ``True``; defaults to
+                       ``False``
 
     When the triggering user is not an admin, the command is not run, and the
-    bot will say the ``message`` if given. By default, it uses ``bot.say``,
-    but when ``reply`` is true, then it uses ``bot.reply`` instead.
+    bot will say the ``message`` if given. By default, it uses
+    :meth:`bot.say() <.bot.Sopel.say>`, but when ``reply`` is true, then it
+    uses :meth:`bot.reply() <.bot.Sopel.reply>` instead.
+
+    .. versionchanged:: 7.0.0
+        Added the ``reply`` parameter.
     """
     def actual_decorator(function):
         @functools.wraps(function)
@@ -371,41 +574,88 @@ def require_admin(message=None, reply=False):
     return actual_decorator
 
 
-def require_owner(message=None):
+def require_owner(message=None, reply=False):  # lgtm [py/similar-function]
     """Decorate a function to require the triggering user to be the bot owner.
 
-    If they are not, `message` will be said if given."""
+    :param str message: optional message said to non-owner user
+    :param bool reply: use :meth:`~.bot.Sopel.reply` instead of
+                       :meth:`~.bot.Sopel.say` when ``True``; defaults to
+                       ``False``
+
+    When the triggering user is not the bot's owner, the command is not run,
+    and the bot will say ``message`` if given. By default, it uses
+    :meth:`bot.say() <.bot.Sopel.say>`, but when ``reply`` is true, then it
+    uses :meth:`bot.reply() <.bot.Sopel.reply>` instead.
+
+    .. versionchanged:: 7.0.0
+        Added the ``reply`` parameter.
+    """
     def actual_decorator(function):
         @functools.wraps(function)
         def guarded(bot, trigger, *args, **kwargs):
             if not trigger.owner:
                 if message and not callable(message):
-                    bot.say(message)
+                    if reply:
+                        bot.reply(message)
+                    else:
+                        bot.say(message)
             else:
                 return function(bot, trigger, *args, **kwargs)
         return guarded
+
     # Hack to allow decorator without parens
     if callable(message):
         return actual_decorator(message)
     return actual_decorator
 
 
-def url(url_rule):
+def url(*url_rules):
     """Decorate a function to handle URLs.
+
+    :param str url_rule: regex pattern to match URLs
 
     This decorator takes a regex string that will be matched against URLs in a
     message. The function it decorates, in addition to the bot and trigger,
     must take a third argument ``match``, which is the regular expression match
-    of the URL. This should be used rather than the matching in trigger, in
-    order to support e.g. the ``.title`` command.
+    of the URL::
+
+        from sopel import module
+
+        @module.url(r'https://example.com/bugs/([a-z0-9]+)')
+        @module.url(r'https://short.com/([a-z0-9]+)')
+        def handle_example_bugs(bot, trigger, match):
+            bot.reply('Found bug ID #%s' % match.group(1))
+
+    This should be used rather than the matching in trigger, in order to
+    support e.g. the ``.title`` command.
+
+    Under the hood, when Sopel collects the decorated handler it uses
+    :meth:`sopel.bot.Sopel.register_url_callback` to register the handler.
+
+    .. versionchanged:: 7.0
+
+        The same function can be decorated multiple times with :func:`url`
+        to register different URL patterns.
+
+    .. versionchanged:: 7.0
+
+        More than one pattern can be provided as positional argument at once.
+
+    .. seealso::
+
+        To detect URLs, Sopel uses a matching pattern built from a list of URL
+        schemes, configured by
+        :attr:`~sopel.config.core_section.CoreSection.auto_url_schemes`.
+
     """
     def actual_decorator(function):
-        @functools.wraps(function)
-        def helper(bot, trigger, match=None):
-            match = match or trigger
-            return function(bot, trigger, match)
-        helper.url_regex = re.compile(url_rule)
-        return helper
+        if not hasattr(function, 'url_regex'):
+            function.url_regex = []
+        for url_rule in url_rules:
+            url_regex = re.compile(url_rule)
+            if url_regex not in function.url_regex:
+                function.url_regex.append(url_regex)
+        return function
     return actual_decorator
 
 
@@ -442,9 +692,15 @@ class example(object):
         ignore:
             List of outputs to ignore. Strings in this list are always
             interpreted as regular expressions.
+        user_help:
+            Whether this example should be displayed in user-facing help output
+            such as `.help command`.
+        online:
+            If true, pytest will mark it as "online".
     """
     def __init__(self, msg, result=None, privmsg=False, admin=False,
-                 owner=False, repeat=1, re=False, ignore=None):
+                 owner=False, repeat=1, re=False, ignore=None,
+                 user_help=False, online=False):
         # Wrap result into a list for get_example_test
         if isinstance(result, list):
             self.result = result
@@ -458,6 +714,7 @@ class example(object):
         self.admin = admin
         self.owner = owner
         self.repeat = repeat
+        self.online = online
 
         if isinstance(ignore, list):
             self.ignore = ignore
@@ -466,19 +723,31 @@ class example(object):
         else:
             self.ignore = []
 
+        self.user_help = user_help
+
     def __call__(self, func):
         if not hasattr(func, "example"):
             func.example = []
 
         import sys
 
+        import sopel.test_tools  # TODO: fix circular import with sopel.bot and sopel.test_tools
+
         # only inject test-related stuff if we're running tests
         # see https://stackoverflow.com/a/44595269/5991
         if 'pytest' in sys.modules and self.result:
+            # avoids doing `import pytest` and causing errors when
+            # dev-dependencies aren't installed
+            pytest = sys.modules['pytest']
+
             test = sopel.test_tools.get_example_test(
                 func, self.msg, self.result, self.privmsg, self.admin,
                 self.owner, self.repeat, self.use_re, self.ignore
             )
+
+            if self.online:
+                test = pytest.mark.online(test)
+
             sopel.test_tools.insert_into_module(
                 test, func.__module__, func.__name__, 'test_example'
             )
@@ -491,6 +760,25 @@ class example(object):
             "result": self.result,
             "privmsg": self.privmsg,
             "admin": self.admin,
+            "help": self.user_help,
         }
         func.example.append(record)
         return func
+
+
+def output_prefix(prefix):
+    """Decorate a function to add a prefix on its output.
+
+    :param str prefix: the prefix to add (must include trailing whitespace if
+                       desired; Sopel does not assume it should add anything)
+
+    Prefix will be added to text sent through:
+
+    * :meth:`bot.say <sopel.bot.SopelWrapper.say>`
+    * :meth:`bot.notice <sopel.bot.SopelWrapper.notice>`
+
+    """
+    def add_attribute(function):
+        function.output_prefix = prefix
+        return function
+    return add_attribute

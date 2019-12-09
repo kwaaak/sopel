@@ -2,7 +2,7 @@
 """
 translate.py - Sopel Translation Module
 Copyright 2008, Sean B. Palmer, inamidst.com
-Copyright © 2013-2014, Elad Alfassa <elad@fedoraproject.org>
+Copyright 2013-2014, Elad Alfassa <elad@fedoraproject.org>
 Licensed under the Eiffel Forum License 2.
 
 https://sopel.chat
@@ -12,18 +12,29 @@ from __future__ import unicode_literals, absolute_import, print_function, divisi
 import json
 import random
 import sys
+
 import requests
 
+from sopel.module import rule, commands, priority, example, unblockable
+from sopel.tools import web, SopelMemory
 
-from sopel import web
-from sopel.module import rule, commands, priority, example
-
-mangle_lines = {}
 if sys.version_info.major >= 3:
     unicode = str
 
 
-def translate(text, in_lang='auto', out_lang='en', verify_ssl=True):
+def setup(bot):
+    if 'mangle_lines' not in bot.memory:
+        bot.memory['mangle_lines'] = SopelMemory()
+
+
+def shutdown(bot):
+    try:
+        del bot.memory['mangle_lines']
+    except KeyError:
+        pass
+
+
+def translate(text, in_lang='auto', out_lang='en'):
     raw = False
     if unicode(out_lang).endswith('-raw'):
         out_lang = out_lang[:-4]
@@ -43,8 +54,7 @@ def translate(text, in_lang='auto', out_lang='en', verify_ssl=True):
         "q": text,
     }
     url = "https://translate.googleapis.com/translate_a/single"
-    result = requests.get(url, params=query, timeout=40, headers=headers,
-                          verify=verify_ssl).text
+    result = requests.get(url, params=query, timeout=40, headers=headers).text
 
     if result == '[,,""]':
         return None, in_lang
@@ -86,14 +96,13 @@ def tr(bot, trigger):
     out_lang = out_lang or 'en'
 
     if in_lang != out_lang:
-        msg, in_lang = translate(phrase, in_lang, out_lang,
-                                 verify_ssl=bot.config.core.verify_ssl)
+        msg, in_lang = translate(phrase, in_lang, out_lang)
         if not in_lang:
             return bot.say("Translation failed, probably because of a rate-limit.")
         if sys.version_info.major < 3 and isinstance(msg, str):
             msg = msg.decode('utf-8')
         if msg:
-            msg = web.decode(msg)  # msg.replace('&#39;', "'")
+            msg = web.decode(msg)
             msg = '"%s" (%s to %s, translate.google.com)' % (msg, in_lang, out_lang)
         else:
             msg = 'The %s to %s translation failed, are you sure you specified valid language abbreviations?' % (in_lang, out_lang)
@@ -104,9 +113,13 @@ def tr(bot, trigger):
 
 
 @commands('translate', 'tr')
-@example('.tr :en :fr my dog', '"mon chien" (en to fr, translate.google.com)')
-@example('.tr היי', '"Hey" (iw to en, translate.google.com)')
-@example('.tr mon chien', '"my dog" (fr to en, translate.google.com)')
+@example('.tr :en :fr my dog',
+         '"mon chien" (en to fr, translate.google.com)',
+         online=True)
+@example('.tr היי', '"Hi" (iw to en, translate.google.com)', online=True)
+@example('.tr mon chien',
+         '"my dog" (fr to en, translate.google.com)',
+         online=True)
 def tr2(bot, trigger):
     """Translates a phrase, with an optional language hint."""
     command = trigger.group(2)
@@ -136,8 +149,7 @@ def tr2(bot, trigger):
 
     src, dest = args
     if src != dest:
-        msg, src = translate(phrase, src, dest,
-                             verify_ssl=bot.config.core.verify_ssl)
+        msg, src = translate(phrase, src, dest)
         if not src:
             return bot.say("Translation failed, probably because of a rate-limit.")
         if sys.version_info.major < 3 and isinstance(msg, str):
@@ -166,8 +178,6 @@ def get_random_lang(long_list, short_list):
 @commands('mangle', 'mangle2')
 def mangle(bot, trigger):
     """Repeatedly translate the input until it makes absolutely no sense."""
-    verify_ssl = bot.config.core.verify_ssl
-    global mangle_lines
     long_lang_list = ['fr', 'de', 'es', 'it', 'no', 'he', 'la', 'ja', 'cy', 'ar', 'yi', 'zh', 'nl', 'ru', 'fi', 'hi', 'af', 'jw', 'mr', 'ceb', 'cs', 'ga', 'sv', 'eo', 'el', 'ms', 'lv']
     lang_list = []
     for __ in range(0, 8):
@@ -175,7 +185,7 @@ def mangle(bot, trigger):
     random.shuffle(lang_list)
     if trigger.group(2) is None:
         try:
-            phrase = (mangle_lines[trigger.sender.lower()], '')
+            phrase = (bot.memory['mangle_lines'][trigger.sender.lower()], '')
         except KeyError:
             bot.reply("What do you want me to mangle?")
             return
@@ -187,8 +197,7 @@ def mangle(bot, trigger):
     for lang in lang_list:
         backup = phrase
         try:
-            phrase = translate(phrase[0], 'en', lang,
-                               verify_ssl=verify_ssl)
+            phrase = translate(phrase[0], 'en', lang)
         except Exception:  # TODO: Be specific
             phrase = False
         if not phrase:
@@ -196,7 +205,7 @@ def mangle(bot, trigger):
             break
 
         try:
-            phrase = translate(phrase[0], lang, 'en', verify_ssl=verify_ssl)
+            phrase = translate(phrase[0], lang, 'en')
         except Exception:  # TODO: Be specific
             phrase = backup
             continue
@@ -209,9 +218,9 @@ def mangle(bot, trigger):
 
 @rule('(.*)')
 @priority('low')
+@unblockable
 def collect_mangle_lines(bot, trigger):
-    global mangle_lines
-    mangle_lines[trigger.sender.lower()] = "%s said '%s'" % (trigger.nick, (trigger.group(0).strip()))
+    bot.memory['mangle_lines'][trigger.sender.lower()] = "%s said '%s'" % (trigger.nick, (trigger.group(0).strip()))
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
  Sopel
 =======
 
-|version| |build| |issues| |coverage-status| |license| |ocbackers| |ocsponsors|
+|version| |build| |issues| |alerts| |coverage-status| |license|
 
 Introduction
 ------------
@@ -37,12 +37,22 @@ Sopel requires ``backports.ssl_match_hostname`` to be installed. Use
 ``yum install python-backports.ssl_match_hostname`` to install it, or download
 and install it manually `from PyPI <https://pypi.org/project/backports.ssl_match_hostname>`_.
 
-Note: Python 2.x is near end of life. Sopel support at that point is TBD.
+Note: Python 2.x is near end of life. Sopel will drop support in version 8.0.
 
 In the source directory (whether cloned or from the tarball) run
 ``setup.py install``. You can then run ``sopel`` to configure and start the
 bot. Alternately, you can just run the ``sopel.py`` file in the source
 directory.
+
+Database Support
+----------------
+Sopel leverages SQLAlchemy to support the following database types: SQLite,
+MySQL, PostgreSQL, MSSQL, Oracle, Firebird, and Sybase. By default Sopel will
+use a SQLite database in the current configuration directory, but alternative
+databases can be configured with the following config options: ``db_type``,
+``db_filename`` (SQLite only), ``db_driver``, ``db_user``, ``db_pass``,
+``db_host``, ``db_port``, and ``db_name``. You will need to manually install
+any packages (system or ``pip``) needed to make your chosen database work.
 
 Adding modules
 --------------
@@ -114,13 +124,9 @@ __ Sponsor_
    :target: https://travis-ci.org/sopel-irc/sopel
 .. |issues| image:: https://img.shields.io/github/issues/sopel-irc/sopel.svg
    :target: https://github.com/sopel-irc/sopel/issues
+.. |alerts| image:: https://img.shields.io/lgtm/alerts/g/sopel-irc/sopel.svg
+   :target: https://lgtm.com/projects/g/sopel-irc/sopel/alerts/
 .. |coverage-status| image:: https://coveralls.io/repos/github/sopel-irc/sopel/badge.svg?branch=master
    :target: https://coveralls.io/github/sopel-irc/sopel?branch=master
 .. |license| image:: https://img.shields.io/pypi/l/sopel.svg
    :target: https://github.com/sopel-irc/sopel/blob/master/COPYING
-.. |ocbackers| image:: https://opencollective.com/sopel/backers/badge.svg
-    :alt: Backers on Open Collective
-    :target: #backers
-.. |ocsponsors| image:: https://opencollective.com/sopel/sponsors/badge.svg
-    :alt: Sponsors on Open Collective
-    :target: #sponsors

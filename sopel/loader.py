@@ -1,12 +1,11 @@
 # coding=utf-8
 from __future__ import unicode_literals, absolute_import, print_function, division
 
-import imp
-import os.path
 import re
 import sys
 
-from sopel.tools import compile_rule, itervalues, get_command_regexp, get_nickname_command_regexp
+from sopel.tools import (compile_rule, itervalues, get_command_regexp,
+                         get_nickname_command_regexp, get_action_command_regexp)
 from sopel.config import core_section
 
 default_prefix = core_section.CoreSection.help_prefix.default
@@ -14,101 +13,6 @@ del core_section
 
 if sys.version_info.major >= 3:
     basestring = (str, bytes)
-
-
-def get_module_description(path):
-    good_file = (os.path.isfile(path) and
-                 path.endswith('.py') and not path.startswith('_'))
-    good_dir = (os.path.isdir(path) and
-                os.path.isfile(os.path.join(path, '__init__.py')))
-    if good_file:
-        name = os.path.basename(path)[:-3]
-        return (name, path, imp.PY_SOURCE)
-    elif good_dir:
-        name = os.path.basename(path)
-        return (name, path, imp.PKG_DIRECTORY)
-    else:
-        return None
-
-
-def _update_modules_from_dir(modules, directory):
-    # Note that this modifies modules in place
-    for path in os.listdir(directory):
-        path = os.path.join(directory, path)
-        result = get_module_description(path)
-        if result:
-            modules[result[0]] = result[1:]
-
-
-def enumerate_modules(config, show_all=False):
-    """Map the names of modules to the location of their file.
-
-    Return a dict mapping the names of modules to a tuple of the module name,
-    the pathname and either `imp.PY_SOURCE` or `imp.PKG_DIRECTORY`. This
-    searches the regular modules directory and all directories specified in the
-    `core.extra` attribute of the `config` object. If two modules have the same
-    name, the last one to be found will be returned and the rest will be
-    ignored. Modules are found starting in the regular directory, followed by
-    `~/.sopel/modules`, and then through the extra directories in the order
-    that the are specified.
-
-    If `show_all` is given as `True`, the `enable` and `exclude`
-    configuration options will be ignored, and all modules will be shown
-    (though duplicates will still be ignored as above).
-    """
-    modules = {}
-
-    # First, add modules from the regular modules directory
-    main_dir = os.path.dirname(os.path.abspath(__file__))
-    modules_dir = os.path.join(main_dir, 'modules')
-    _update_modules_from_dir(modules, modules_dir)
-    for path in os.listdir(modules_dir):
-        break
-
-    # Then, find PyPI installed modules
-    # TODO does this work with all possible install mechanisms?
-    try:
-        import sopel_modules
-    except Exception:  # TODO: Be specific
-        pass
-    else:
-        for directory in sopel_modules.__path__:
-            _update_modules_from_dir(modules, directory)
-
-    # Next, look in ~/.sopel/modules
-    home_modules_dir = os.path.join(config.homedir, 'modules')
-    if not os.path.isdir(home_modules_dir):
-        os.makedirs(home_modules_dir)
-    _update_modules_from_dir(modules, home_modules_dir)
-
-    # Last, look at all the extra directories.
-    for directory in config.core.extra:
-        _update_modules_from_dir(modules, directory)
-
-    # Coretasks is special. No custom user coretasks.
-    ct_path = os.path.join(main_dir, 'coretasks.py')
-    modules['coretasks'] = (ct_path, imp.PY_SOURCE)
-
-    # If caller wants all of them, don't apply white and blacklists
-    if show_all:
-        return modules
-
-    # Apply whitelist, if present
-    enable = config.core.enable
-    if enable:
-        enabled_modules = {'coretasks': modules['coretasks']}
-        for module in enable:
-            if module in modules:
-                enabled_modules[module] = modules[module]
-        modules = enabled_modules
-
-    # Apply blacklist, if present
-    exclude = config.core.exclude
-    for module in exclude:
-        if module in modules:
-            del modules[module]
-
-    return modules
 
 
 def trim_docstring(doc):
@@ -141,14 +45,23 @@ def clean_callable(func, config):
     help_prefix = config.core.help_prefix
     func._docs = {}
     doc = trim_docstring(func.__doc__)
-    example = None
+    examples = []
+
+    func.thread = getattr(func, 'thread', True)
+
+    if not is_triggerable(func):
+        # Rate-limiting, priority, etc. doesn't apply to non-triggerable functions.
+        # Adding the default attributes below is a waste of memory, as well as
+        # potentially confusing to other code.
+        return
 
     func.unblockable = getattr(func, 'unblockable', False)
+    func.echo = getattr(func, 'echo', False)
     func.priority = getattr(func, 'priority', 'medium')
-    func.thread = getattr(func, 'thread', True)
     func.rate = getattr(func, 'rate', 0)
     func.channel_rate = getattr(func, 'channel_rate', 0)
     func.global_rate = getattr(func, 'global_rate', 0)
+    func.output_prefix = getattr(func, 'output_prefix', '')
 
     if not hasattr(func, 'event'):
         func.event = ['PRIVMSG']
@@ -163,44 +76,79 @@ def clean_callable(func, config):
             func.rule = [func.rule]
         func.rule = [compile_rule(nick, rule, alias_nicks) for rule in func.rule]
 
-    if hasattr(func, 'commands') or hasattr(func, 'nickname_commands'):
+    if any(hasattr(func, attr) for attr in ['commands', 'nickname_commands', 'action_commands']):
         func.rule = getattr(func, 'rule', [])
         for command in getattr(func, 'commands', []):
             regexp = get_command_regexp(prefix, command)
-            func.rule.append(regexp)
+            if regexp not in func.rule:
+                func.rule.append(regexp)
         for command in getattr(func, 'nickname_commands', []):
             regexp = get_nickname_command_regexp(nick, command, alias_nicks)
-            func.rule.append(regexp)
+            if regexp not in func.rule:
+                func.rule.append(regexp)
+        for command in getattr(func, 'action_commands', []):
+            regexp = get_action_command_regexp(command)
+            if regexp not in func.rule:
+                func.rule.append(regexp)
         if hasattr(func, 'example'):
-            example = func.example[0]["example"]
-            example = example.replace('$nickname', nick)
-            if example[0] != help_prefix and not example.startswith(nick):
-                example = example.replace(default_prefix, help_prefix, 1)
-        if doc or example:
+            # If no examples are flagged as user-facing, just show the first one like Sopel<7.0 did
+            examples = [rec["example"] for rec in func.example if rec["help"]] or [func.example[0]["example"]]
+            for i, example in enumerate(examples):
+                example = example.replace('$nickname', nick)
+                if example[0] != help_prefix and not example.startswith(nick):
+                    example = example.replace(default_prefix, help_prefix, 1)
+                examples[i] = example
+        if doc or examples:
             cmds = []
             cmds.extend(getattr(func, 'commands', []))
             cmds.extend(getattr(func, 'nickname_commands', []))
             for command in cmds:
-                func._docs[command] = (doc, example)
+                func._docs[command] = (doc, examples)
 
     if hasattr(func, 'intents'):
-        func.intents = [re.compile(intent, re.IGNORECASE) for intent in func.intents]
-
-
-def load_module(name, path, type_):
-    """Load a module, and sort out the callables and shutdowns"""
-    if type_ == imp.PY_SOURCE:
-        with open(path) as mod:
-            module = imp.load_module(name, mod, path, ('.py', 'U', type_))
-    elif type_ == imp.PKG_DIRECTORY:
-        module = imp.load_module(name, None, path, ('', '', type_))
-    else:
-        raise TypeError('Unsupported module type')
-    return module, os.path.getmtime(path)
+        # Can be implementation-dependent
+        _regex_type = type(re.compile(''))
+        func.intents = [
+            (intent
+                if isinstance(intent, _regex_type)
+                else re.compile(intent, re.IGNORECASE))
+            for intent in func.intents
+        ]
 
 
 def is_triggerable(obj):
-    return any(hasattr(obj, attr) for attr in ('rule', 'intents', 'commands', 'nickname_commands'))
+    """Check if ``obj`` can handle the bot's triggers.
+
+    :param obj: any :term:`function` to check
+    :return: ``True`` if ``obj`` can handle the bot's triggers
+
+    A triggerable is a callable that will be used by the bot to handle a
+    particular trigger (i.e. an IRC message): it can be a regex rule, an
+    event, an intent, a command, a nickname command, or an action command.
+    However, it must not be a job or a URL callback.
+
+    .. seealso::
+
+        Many of the decorators defined in :mod:`sopel.module` make the
+        decorated function a triggerable object.
+    """
+    forbidden_attrs = (
+        'interval',
+        'url_regex',
+    )
+    forbidden = any(hasattr(obj, attr) for attr in forbidden_attrs)
+
+    allowed_attrs = (
+        'rule',
+        'event',
+        'intents',
+        'commands',
+        'nickname_commands',
+        'action_commands',
+    )
+    allowed = any(hasattr(obj, attr) for attr in allowed_attrs)
+
+    return allowed and not forbidden
 
 
 def clean_module(module, config):

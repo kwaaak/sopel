@@ -1,24 +1,24 @@
 # coding=utf-8
-# Copyright 2013 Elsie Powell - embolalia.com
-# Licensed under the Eiffel Forum License 2.
+"""
+wikipedia.py - Sopel Wikipedia Module
+Copyright 2013 Elsie Powell - embolalia.com
+Licensed under the Eiffel Forum License 2.
+
+https://sopel.chat
+"""
 from __future__ import unicode_literals, absolute_import, print_function, division
 
-from sopel.config.types import StaticSection, ValidatedAttribute
-from sopel.module import NOLIMIT, commands, example, rule
-from requests import get
 import re
 
-import sys
-if sys.version_info.major < 3:
-    from urllib import quote as _quote
-    from urlparse import unquote as _unquote
-    quote = lambda s: _quote(s.encode('utf-8')).decode('utf-8')
-    unquote = lambda s: _unquote(s.encode('utf-8')).decode('utf-8')
-else:
-    from urllib.parse import quote, unquote
+from requests import get
+
+from sopel.config.types import StaticSection, ValidatedAttribute
+from sopel.module import NOLIMIT, commands, example, url
+from sopel.tools.web import quote, unquote
+
 
 REDIRECT = re.compile(r'^REDIRECT (.*)')
-WIKIPEDIA_REGEX = re.compile('([a-z]+).(wikipedia.org/wiki/)([^ ]+)')
+WIKIPEDIA_REGEX = r'/([a-z]+\.wikipedia\.org)/wiki/((?!File\:)[^ ]+)'
 
 
 class WikipediaSection(StaticSection):
@@ -30,11 +30,6 @@ class WikipediaSection(StaticSection):
 
 def setup(bot):
     bot.config.define_section('wikipedia', WikipediaSection)
-    bot.register_url_callback(WIKIPEDIA_REGEX, mw_info)
-
-
-def shutdown(bot):
-    bot.unregister_url_callback(WIKIPEDIA_REGEX)
 
 
 def configure(config):
@@ -52,7 +47,8 @@ def configure(config):
 
 
 def mw_search(server, query, num):
-    """
+    """Search a MediaWiki site
+
     Searches the specified MediaWiki server for the given query, and returns
     the specified number of results.
     """
@@ -64,8 +60,7 @@ def mw_search(server, query, num):
     if 'query' in query:
         query = query['query']['search']
         return [r['title'] for r in query]
-    else:
-        return None
+    return None
 
 
 def say_snippet(bot, trigger, server, query, show_url=True):
@@ -87,10 +82,7 @@ def say_snippet(bot, trigger, server, query, show_url=True):
 
 
 def mw_snippet(server, query):
-    """
-    Retrives a snippet of the specified length from the given page on the given
-    server.
-    """
+    """Retrieves a snippet of the given page from the given MediaWiki server."""
     snippet_url = ('https://' + server + '/w/api.php?format=json'
                    '&action=query&prop=extracts&exintro&explaintext'
                    '&exchars=300&redirects&titles=')
@@ -105,13 +97,9 @@ def mw_snippet(server, query):
     return snippet['extract']
 
 
-@rule(r'.*\/([a-z]+\.wikipedia\.org)\/wiki\/((?!File\:)[^ ]+).*')
-def mw_info(bot, trigger, found_match=None):
-    """
-    Retrives a snippet of the specified length from the given page on the given
-    server.
-    """
-    match = found_match or trigger
+@url(WIKIPEDIA_REGEX)
+def mw_info(bot, trigger, match):
+    """Retrieves and outputs a snippet from the linked page."""
     say_snippet(bot, trigger, match.group(1), unquote(match.group(2)), show_url=False)
 
 

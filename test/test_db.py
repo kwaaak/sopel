@@ -151,6 +151,19 @@ def test_get_nick_value(db):
         assert found_value == value
 
 
+def test_get_nick_value_default(db):
+    assert db.get_nick_value("TestUser", "DoesntExist") is None
+    assert db.get_nick_value("TestUser", "DoesntExist", "MyDefault") == "MyDefault"
+
+
+def test_delete_nick_value(db):
+    nick = 'Embolalia'
+    db.set_nick_value(nick, 'wasd', 'uldr')
+    assert db.get_nick_value(nick, 'wasd') == 'uldr'
+    db.delete_nick_value(nick, 'wasd')
+    assert db.get_nick_value(nick, 'wasd') is None
+
+
 def test_unalias_nick(db):
     conn = sqlite3.connect(db_filename)
     nick = 'Embolalia'
@@ -232,12 +245,24 @@ def test_set_channel_value(db):
     assert result == '"zxcv"'
 
 
+def test_delete_channel_value(db):
+    db.set_channel_value('#asdf', 'wasd', 'uldr')
+    assert db.get_channel_value('#asdf', 'wasd') == 'uldr'
+    db.delete_channel_value('#asdf', 'wasd')
+    assert db.get_channel_value('#asdf', 'wasd') is None
+
+
 def test_get_channel_value(db):
     conn = sqlite3.connect(db_filename)
     conn.execute("INSERT INTO channel_values VALUES ('#asdf', 'qwer', '\"zxcv\"')")
     conn.commit()
     result = db.get_channel_value('#asdf', 'qwer')
     assert result == 'zxcv'
+
+
+def test_get_channel_value_default(db):
+    assert db.get_channel_value("TestChan", "DoesntExist") is None
+    assert db.get_channel_value("TestChan", "DoesntExist", "MyDefault") == "MyDefault"
 
 
 def test_get_nick_or_channel_value(db):
@@ -247,6 +272,11 @@ def test_get_nick_or_channel_value(db):
     assert db.get_nick_or_channel_value('#asdf', 'qwer') == '/.,m'
 
 
+def test_get_nick_or_channel_value_default(db):
+    assert db.get_nick_or_channel_value("Test", "DoesntExist") is None
+    assert db.get_nick_or_channel_value("Test", "DoesntExist", "MyDefault") == "MyDefault"
+
+
 def test_get_preferred_value(db):
     db.set_nick_value('asdf', 'qwer', 'poiu')
     db.set_channel_value('#asdf', 'qwer', '/.,m')
@@ -254,3 +284,32 @@ def test_get_preferred_value(db):
     names = ['asdf', '#asdf']
     assert db.get_preferred_value(names, 'qwer') == 'poiu'
     assert db.get_preferred_value(names, 'lkjh') == '1234'
+
+
+def test_set_plugin_value(db):
+    conn = sqlite3.connect(db_filename)
+    db.set_plugin_value('plugname', 'qwer', 'zxcv')
+    result = conn.execute(
+        'SELECT value FROM plugin_values WHERE plugin = ? and key = ?',
+        ['plugname', 'qwer']).fetchone()[0]
+    assert result == '"zxcv"'
+
+
+def test_get_plugin_value(db):
+    conn = sqlite3.connect(db_filename)
+    conn.execute("INSERT INTO plugin_values VALUES ('plugname', 'qwer', '\"zxcv\"')")
+    conn.commit()
+    result = db.get_plugin_value('plugname', 'qwer')
+    assert result == 'zxcv'
+
+
+def test_get_plugin_value_default(db):
+    assert db.get_plugin_value("TestPlugin", "DoesntExist") is None
+    assert db.get_plugin_value("TestPlugin", "DoesntExist", "MyDefault") == "MyDefault"
+
+
+def test_delete_plugin_value(db):
+    db.set_plugin_value('plugin', 'wasd', 'uldr')
+    assert db.get_plugin_value('plugin', 'wasd') == 'uldr'
+    db.delete_plugin_value('plugin', 'wasd')
+    assert db.get_plugin_value('plugin', 'wasd') is None

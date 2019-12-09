@@ -8,12 +8,17 @@ https://sopel.chat
 """
 from __future__ import unicode_literals, absolute_import, print_function, division
 
-from sopel.module import commands, example
-import requests
 import re
 import sys
+
+import requests
+
+from sopel.module import commands, example
+from sopel.tools import web
+
 if sys.version_info.major >= 3:
     unicode = str
+
 
 uri = 'https://en.wikipedia.org/wiki/List_of_Internet_top-level_domains'
 r_tag = re.compile(r'<(?!!)[^>]+>')
@@ -48,9 +53,9 @@ def gettld(bot, trigger):
         desc = matches[2]
         if len(desc) > 400:
             desc = desc[:400] + "..."
-        reply = "%s -- %s. IDN: %s, DNSSEC: %s" % (matches[1], desc,
-                matches[3], matches[4])
-        bot.reply(reply)
+        reply = "%s -- %s. IDN: %s, DNSSEC: %s" % (
+            matches[1], desc, matches[3], matches[4]
+        )
     else:
         search = r'<td><a href="\S+" title="\S+">.{0}</a></td>\n<td><span class="flagicon"><img.*?\">(.*?)</a></td>\n<td[^>]*>(.*?)</td>\n<td[^>]*>(.*?)</td>\n<td[^>]*>(.*?)</td>\n<td[^>]*>(.*?)</td>\n<td[^>]*>(.*?)</td>\n'
         search = search.format(unicode(tld))
@@ -69,4 +74,6 @@ def gettld(bot, trigger):
             reply = "%s (%s, %s). IDN: %s, DNSSEC: %s, SLD: %s" % (dict_val["country"], dict_val["expl"], dict_val["notes"], dict_val["idn"], dict_val["dnssec"], dict_val["sld"])
         else:
             reply = "No matches found for TLD: {0}".format(unicode(tld))
-        bot.reply(reply)
+    # Final touches + output
+    reply = web.decode(reply)
+    bot.reply(reply)

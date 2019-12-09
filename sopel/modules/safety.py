@@ -8,20 +8,24 @@ This module uses virustotal.com
 """
 from __future__ import unicode_literals, absolute_import, print_function, division
 
-from sopel.config.types import StaticSection, ValidatedAttribute, ListAttribute
-from sopel.formatting import color, bold
-from sopel.logger import get_logger
-from sopel.module import OP
-import sopel.tools
-import sys
-import time
+import logging
 import os.path
 import re
+import sys
+import threading
+import time
+
 import requests
+
+from sopel.config.types import StaticSection, ValidatedAttribute, ListAttribute
+from sopel.formatting import color, bold
+from sopel.module import OP
+import sopel.tools
 
 try:
     # This is done separately from the below version if/else because JSONDecodeError
     # didn't appear until Python 3.5, but Sopel claims support for 3.3+
+    # Redo this whole block of nonsense when dropping py2/old py3 support
     from json import JSONDecodeError as InvalidJSONResponse
 except ImportError:
     InvalidJSONResponse = ValueError
@@ -34,11 +38,13 @@ else:
     from urllib import urlretrieve
     from urlparse import urlparse
 
-LOGGER = get_logger(__name__)
+
+LOGGER = logging.getLogger(__name__)
 
 vt_base_api_url = 'https://www.virustotal.com/vtapi/v2/url/'
 malware_domains = set()
 known_good = []
+cache_limit = 512
 
 
 class SafetySection(StaticSection):
@@ -77,14 +83,17 @@ def configure(config):
 def setup(bot):
     bot.config.define_section('safety', SafetySection)
 
-    bot.memory['safety_cache'] = sopel.tools.SopelMemory()
+    if 'safety_cache' not in bot.memory:
+        bot.memory['safety_cache'] = sopel.tools.SopelMemory()
+    if 'safety_cache_lock' not in bot.memory:
+        bot.memory['safety_cache_lock'] = threading.Lock()
     for item in bot.config.safety.known_good:
         known_good.append(re.compile(item, re.I))
 
     loc = os.path.join(bot.config.homedir, 'malwaredomains.txt')
     if os.path.isfile(loc):
         if os.path.getmtime(loc) < time.time() - 24 * 60 * 60 * 7:
-            # File exists but older than one week, update
+            # File exists but older than one week — update it
             _download_malwaredomains_db(loc)
     else:
         _download_malwaredomains_db(loc)
@@ -95,15 +104,21 @@ def setup(bot):
                 malware_domains.add(clean_line)
 
 
+def shutdown(bot):
+    bot.memory.pop('safety_cache', None)
+    bot.memory.pop('safety_cache_lock', None)
+
+
 def _download_malwaredomains_db(path):
-    print('Downloading malwaredomains db...')
-    urlretrieve('https://mirror1.malwaredomains.com/files/justdomains', path)
+    url = 'https://mirror1.malwaredomains.com/files/justdomains'
+    LOGGER.info('Downloading malwaredomains db from %s', url)
+    urlretrieve(url, path)
 
 
 @sopel.module.rule(r'(?u).*(https?://\S+).*')
 @sopel.module.priority('high')
 def url_handler(bot, trigger):
-    """ Check for malicious URLs """
+    """Checks for malicious URLs"""
     check = True    # Enable URL checking
     strict = False  # Strict mode: kick on malicious URL
     positives = 0   # Number of engines saying it's malicious
@@ -126,7 +141,7 @@ def url_handler(bot, trigger):
             use_vt = False
 
     if not check:
-        return  # Not overriden by DB, configured default off
+        return  # Not overridden by DB, configured default off
 
     try:
         netloc = urlparse(trigger.group(1)).netloc
@@ -147,12 +162,12 @@ def url_handler(bot, trigger):
                 r = requests.post(vt_base_api_url + 'report', data=payload)
                 r.raise_for_status()
                 result = r.json()
-                age = time.time()
+                fetched = time.time()
                 data = {'positives': result['positives'],
                         'total': result['total'],
-                        'age': age}
+                        'fetched': fetched}
                 bot.memory['safety_cache'][trigger] = data
-                if len(bot.memory['safety_cache']) > 1024:
+                if len(bot.memory['safety_cache']) >= (2 * cache_limit):
                     _clean_cache(bot)
             else:
                 print('using cache')
@@ -160,15 +175,15 @@ def url_handler(bot, trigger):
             positives = result['positives']
             total = result['total']
     except requests.exceptions.RequestException:
+        # Ignoring exceptions with VT so MalwareDomains will always work
         LOGGER.debug('[VirusTotal] Error obtaining response.', exc_info=True)
-        pass  # Ignoring exceptions with VT so MalwareDomains will always work
     except InvalidJSONResponse:
+        # Ignoring exceptions with VT so MalwareDomains will always work
         LOGGER.debug('[VirusTotal] Malformed response (invalid JSON).', exc_info=True)
-        pass  # Ignoring exceptions with VT so MalwareDomains will always work
 
     if unicode(netloc).lower() in malware_domains:
         # malwaredomains is more trustworthy than some VT engines
-        # therefor it gets a weight of 10 engines when calculating confidence
+        # therefore it gets a weight of 10 engines when calculating confidence
         positives += 10
         total += 10
 
@@ -179,13 +194,12 @@ def url_handler(bot, trigger):
         msg += '(confidence %s - %s/%s)' % (confidence, positives, total)
         bot.say('[' + bold(color('WARNING', 'red')) + '] ' + msg)
         if strict:
-            bot.write(['KICK', trigger.sender, trigger.nick,
-                       'Posted a malicious link'])
+            bot.kick(trigger.nick, trigger.sender, 'Posted a malicious link')
 
 
 @sopel.module.commands('safety')
 def toggle_safety(bot, trigger):
-    """ Set safety setting for channel """
+    """Set safety setting for channel"""
     if not trigger.admin and bot.channels[trigger.sender].privileges[trigger.nick] < OP:
         bot.reply('Only channel operators can change safety settings')
         return
@@ -200,17 +214,38 @@ def toggle_safety(bot, trigger):
     bot.reply('Safety is now set to "%s" on this channel' % trigger.group(2))
 
 
-# Clean the cache every day, also when > 1024 entries
+# Clean the cache every day
+# Code above also calls this if there are too many cache entries
 @sopel.module.interval(24 * 60 * 60)
 def _clean_cache(bot):
-    """ Cleanup old entries in URL cache """
-    # TODO probably should be using locks here, to make sure stuff doesn't
-    # explode
-    oldest_key_age = 0
-    oldest_key = ''
-    for key, data in sopel.tools.iteritems(bot.memory['safety_cache']):
-        if data['age'] > oldest_key_age:
-            oldest_key_age = data['age']
-            oldest_key = key
-    if oldest_key in bot.memory['safety_cache']:
-        del bot.memory['safety_cache'][oldest_key]
+    """Cleans up old entries in URL safety cache."""
+    if bot.memory['safety_cache_lock'].acquire(False):
+        LOGGER.info('Starting safety cache cleanup...')
+        try:
+            # clean up by age first
+            cutoff = time.time() - (7 * 24 * 60 * 60)  # 7 days ago
+            old_keys = []
+            for key, data in sopel.tools.iteritems(bot.memory['safety_cache']):
+                if data['fetched'] <= cutoff:
+                    old_keys.append(key)
+            for key in old_keys:
+                bot.memory['safety_cache'].pop(key, None)
+
+            # clean up more values if the cache is still too big
+            overage = bot.memory['safety_cache'] - cache_limit
+            if overage > 0:
+                extra_keys = sorted(
+                    (data.fetched, key)
+                    for (key, data)
+                    in bot.memory['safety_cache'].items())[:overage]
+                for (_, key) in extra_keys:
+                    bot.memory['safety_cache'].pop(key, None)
+        finally:
+            # No matter what errors happen (or not), release the lock
+            bot.memory['safety_cache_lock'].release()
+
+        LOGGER.info('Safety cache cleanup finished.')
+    else:
+        LOGGER.info(
+            'Skipping safety cache cleanup: Cache is locked, '
+            'cleanup already running.')

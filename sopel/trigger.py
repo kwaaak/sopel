@@ -1,11 +1,18 @@
 # coding=utf-8
+"""Sopel IRC Trigger Lines"""
 from __future__ import unicode_literals, absolute_import, print_function, division
 
 import re
 import sys
 import datetime
 
-import sopel.tools
+from sopel import tools
+
+
+__all__ = [
+    'PreTrigger',
+    'Trigger',
+]
 
 if sys.version_info.major >= 3:
     unicode = str
@@ -20,8 +27,9 @@ class PreTrigger(object):
 
     def __init__(self, own_nick, line):
         """own_nick is the bot's nick, needed to correctly parse sender.
-        line is the full line from the server."""
-        line = line.strip('\r')
+        line is the full line from the server or from simulated echo
+        message."""
+        line = line.strip('\r\n')
         self.line = line
 
         # Break off IRCv3 message tags, if present
@@ -72,12 +80,12 @@ class PreTrigger(object):
         self.args = self.args[1:]
         components = PreTrigger.component_regex.match(self.hostmask or '').groups()
         self.nick, self.user, self.host = components
-        self.nick = sopel.tools.Identifier(self.nick)
+        self.nick = tools.Identifier(self.nick)
 
         # If we have arguments, the first one is the sender
         # Unless it's a QUIT event
         if self.args and self.event != 'QUIT':
-            target = sopel.tools.Identifier(self.args[0])
+            target = tools.Identifier(self.args[0])
         else:
             target = None
 
@@ -167,7 +175,7 @@ class Trigger(unicode):
     """The account name of the user sending the message.
 
     This is only available if either the account-tag or the account-notify and
-    extended-join capabilites are available. If this isn't the case, or the user
+    extended-join capabilities are available. If this isn't the case, or the user
     sending the message isn't logged in, this will be None.
     """
 
@@ -179,7 +187,7 @@ class Trigger(unicode):
         self._is_privmsg = message.sender and message.sender.is_nick()
 
         def match_host_or_nick(pattern):
-            pattern = sopel.tools.get_hostmask_regex(pattern)
+            pattern = tools.get_hostmask_regex(pattern)
             return bool(
                 pattern.match(self.nick) or
                 pattern.match('@'.join((self.nick, self.host)))

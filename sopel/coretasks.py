@@ -12,22 +12,24 @@ dispatch function in bot.py and making it easier to maintain.
 # Licensed under the Eiffel Forum License 2.
 from __future__ import unicode_literals, absolute_import, print_function, division
 
+import logging
 from random import randint
+import datetime
 import re
 import sys
 import time
 import sopel
 import sopel.module
-from sopel.bot import _CapReq
+import sopel.tools.web
+from sopel.irc.utils import CapReq
 from sopel.tools import Identifier, iteritems, events
 from sopel.tools.target import User, Channel
 import base64
-from sopel.logger import get_logger
 
 if sys.version_info.major >= 3:
     unicode = str
 
-LOGGER = get_logger(__name__)
+LOGGER = logging.getLogger(__name__)
 
 batched_caps = {}
 who_reqs = {}  # Keeps track of reqs coming from this module, rather than others
@@ -35,39 +37,32 @@ who_reqs = {}  # Keeps track of reqs coming from this module, rather than others
 
 def auth_after_register(bot):
     """Do NickServ/AuthServ auth"""
-    if bot.config.core.auth_method == 'nickserv':
-        nickserv_name = bot.config.core.auth_target or 'NickServ'
-        bot.msg(
-            nickserv_name,
-            'IDENTIFY %s' % bot.config.core.auth_password
-        )
+    if bot.config.core.auth_method:
+        auth_method = bot.config.core.auth_method
+        auth_username = bot.config.core.auth_username
+        auth_password = bot.config.core.auth_password
+        auth_target = bot.config.core.auth_target
+    elif bot.config.core.nick_auth_method:
+        auth_method = bot.config.core.nick_auth_method
+        auth_username = (bot.config.core.nick_auth_username or
+                         bot.config.core.nick)
+        auth_password = bot.config.core.nick_auth_password
+        auth_target = bot.config.core.nick_auth_target
+    else:
+        return
 
-    elif bot.config.core.auth_method == 'authserv':
-        account = bot.config.core.auth_username
-        password = bot.config.core.auth_password
-        bot.write((
-            'AUTHSERV auth',
-            account + ' ' + password
-        ))
-
-    elif bot.config.core.auth_method == 'Q':
-        account = bot.config.core.auth_username
-        password = bot.config.core.auth_password
-        bot.write((
-            'AUTH',
-            account + ' ' + password
-        ))
-
-    elif bot.config.core.auth_method == 'userserv':
-        userserv_name = bot.config.core.auth_target or 'UserServ'
-        account = bot.config.core.auth_username
-        password = bot.config.core.auth_password
-        bot.msg(userserv_name, "LOGIN {account} {password}".format(
-                account=account, password=password))
+    if auth_method == 'nickserv':
+        bot.say('IDENTIFY %s' % auth_password, auth_target or 'NickServ')
+    elif auth_method == 'authserv':
+        bot.write(('AUTHSERV auth', auth_username + ' ' + auth_password))
+    elif auth_method == 'Q':
+        bot.write(('AUTH', auth_username + ' ' + auth_password))
+    elif auth_method == 'userserv':
+        bot.say("LOGIN %s %s" % (auth_username, auth_password),
+                auth_target or 'UserServ')
 
 
 @sopel.module.event(events.RPL_WELCOME, events.RPL_LUSERCLIENT)
-@sopel.module.rule('.*')
 @sopel.module.thread(False)
 @sopel.module.unblockable
 def startup(bot, trigger):
@@ -89,7 +84,7 @@ def startup(bot, trigger):
     auth_after_register(bot)
 
     modes = bot.config.core.modes
-    bot.write(('MODE ', '%s +%s' % (bot.nick, modes)))
+    bot.write(('MODE', '%s +%s' % (bot.nick, modes)))
 
     bot.memory['retry_join'] = dict()
 
@@ -114,7 +109,7 @@ def startup(bot, trigger):
             "more secure. If you'd like to do this, make sure you're logged in "
             "and reply with \"{}useserviceauth\""
         ).format(bot.config.core.help_prefix)
-        bot.msg(bot.config.core.owner, msg)
+        bot.say(msg, bot.config.core.owner)
 
 
 @sopel.module.require_privmsg()
@@ -138,7 +133,6 @@ def enable_service_auth(bot, trigger):
 
 
 @sopel.module.event(events.ERR_NOCHANMODES)
-@sopel.module.rule('.*')
 @sopel.module.priority('high')
 def retry_join(bot, trigger):
     """Give NickServer enough time to identify on a +R channel.
@@ -185,11 +179,13 @@ def handle_names(bot, trigger):
     # it'd be worth it.
     # If this ever needs to be updated, remember to change the mode handling in
     # the WHO-handler functions below, too.
-    mapping = {'+': sopel.module.VOICE,
-               '%': sopel.module.HALFOP,
-               '@': sopel.module.OP,
-               '&': sopel.module.ADMIN,
-               '~': sopel.module.OWNER}
+    mapping = {
+        "+": sopel.module.VOICE,
+        "%": sopel.module.HALFOP,
+        "@": sopel.module.OP,
+        "&": sopel.module.ADMIN,
+        "~": sopel.module.OWNER,
+    }
 
     for name in names:
         priv = 0
@@ -217,60 +213,86 @@ def handle_names(bot, trigger):
 def track_modes(bot, trigger):
     """Track usermode changes and keep our lists of ops up to date."""
     # Mode message format: <channel> *( ( "-" / "+" ) *<modes> *<modeparams> )
-    channel = Identifier(trigger.args[0])
-    line = trigger.args[1:]
+    if len(trigger.args) < 3:
+        # We need at least [channel, mode, nickname] to do anything useful
+        # MODE messages with fewer args won't help us
+        LOGGER.debug("Received an apparently useless MODE message: {}"
+                     .format(trigger.raw))
+        return
+    # Our old MODE parsing code checked if any of the args was empty.
+    # Somewhere around here would be a good place to re-implement that if it's
+    # actually necessary to guard against some non-compliant IRCd. But for now
+    # let's just log malformed lines to the debug log.
+    if not all(trigger.args):
+        LOGGER.debug("The server sent a possibly malformed MODE message: {}"
+                     .format(trigger.raw))
 
+    # From here on, we will make a (possibly dangerous) assumption that the
+    # received MODE message is more-or-less compliant
+    channel = Identifier(trigger.args[0])
     # If the first character of where the mode is being set isn't a #
     # then it's a user mode, not a channel mode, so we'll ignore it.
+    # TODO: Handle CHANTYPES from ISUPPORT numeric (005)
+    # (Actually, most of this function should be rewritten again when we parse
+    # ISUPPORT...)
     if channel.is_nick():
         return
 
-    mapping = {'v': sopel.module.VOICE,
-               'h': sopel.module.HALFOP,
-               'o': sopel.module.OP,
-               'a': sopel.module.ADMIN,
-               'q': sopel.module.OWNER}
+    modestring = trigger.args[1]
+    nicks = [Identifier(nick) for nick in trigger.args[2:]]
 
+    mapping = {
+        "v": sopel.module.VOICE,
+        "h": sopel.module.HALFOP,
+        "o": sopel.module.OP,
+        "a": sopel.module.ADMIN,
+        "q": sopel.module.OWNER,
+    }
+
+    # Parse modes before doing anything else
     modes = []
-    for arg in line:
-        if len(arg) == 0:
-            continue
-        if arg[0] in '+-':
-            # There was a comment claiming IRC allows e.g. MODE +aB-c foo, but
-            # I don't see it in any RFCs. Leaving in the extra parsing for now.
-            sign = ''
-            modes = []
-            for char in arg:
-                if char == '+' or char == '-':
-                    sign = char
-                else:
-                    modes.append(sign + char)
-        else:
-            arg = Identifier(arg)
-            for mode in modes:
-                priv = bot.channels[channel].privileges.get(arg, 0)
-                # Log a warning if the two privilege-tracking data structures
-                # get out of sync. That should never happen.
-                # This is a good place to verify that bot.channels is doing
-                # what it's supposed to do before ultimately removing the old,
-                # deprecated bot.privileges structure completely.
-                ppriv = bot.privileges[channel].get(arg, 0)
-                if priv != ppriv:
-                    LOGGER.warning("Privilege data error! Please share Sopel's"
-                                   "raw log with the developers, if enabled. "
-                                   "(Expected {} == {} for {} in {}.)"
-                                   .format(priv, ppriv, arg, channel))
-                value = mapping.get(mode[1])
-                if value is not None:
-                    if mode[0] == '+':
-                        priv = priv | value
-                    else:
-                        priv = priv & ~value
-                    bot.privileges[channel][arg] = priv
-                    bot.channels[channel].privileges[arg] = priv
+    sign = ''
+    for char in modestring:
+        # There was a comment claiming IRC allows e.g. MODE +aB-c foo, but it
+        # doesn't seem to appear in any RFCs. But modern.ircdocs.horse shows
+        # it, so we'll leave in the extra parsing for now.
+        if char in '+-':
+            sign = char
+        elif char in mapping:
+            # Filter out unexpected modes and hope they don't have parameters
+            modes.append(sign + char)
+
+    # Try to map modes to arguments, after sanity-checking
+    if len(modes) != len(nicks) or not all([nick.is_nick() for nick in nicks]):
+        # Something fucky happening, like unusual batching of non-privilege
+        # modes together with the ones we expect. Way easier to just re-WHO
+        # than try to account for non-standard parameter-taking modes.
+        _send_who(bot, channel)
+        return
+
+    for (mode, nick) in zip(modes, nicks):
+        priv = bot.channels[channel].privileges.get(nick, 0)
+        # Log a warning if the two privilege-tracking data structures
+        # get out of sync. That should never happen.
+        # This is a good place to verify that bot.channels is doing
+        # what it's supposed to do before ultimately removing the old,
+        # deprecated bot.privileges structure completely.
+        ppriv = bot.privileges[channel].get(nick, 0)
+        if priv != ppriv:
+            LOGGER.warning("Privilege data error! Please share Sopel's"
+                           "raw log with the developers, if enabled. "
+                           "(Expected {} == {} for {} in {}.)"
+                           .format(priv, ppriv, nick, channel))
+        value = mapping.get(mode[1])
+        if value is not None:
+            if mode[0] == '+':
+                priv = priv | value
+            else:
+                priv = priv & ~value
+            bot.privileges[channel][nick] = priv
+            bot.channels[channel].privileges[nick] = priv
 
 
-@sopel.module.rule('.*')
 @sopel.module.event('NICK')
 @sopel.module.priority('high')
 @sopel.module.thread(False)
@@ -282,19 +304,19 @@ def track_nicks(bot, trigger):
 
     # Give debug mssage, and PM the owner, if the bot's own nick changes.
     if old == bot.nick and new != bot.nick:
-        privmsg = ("Hi, I'm your bot, %s."
-                   "Something has made my nick change. "
-                   "This can cause some problems for me, "
-                   "and make me do weird things. "
-                   "You'll probably want to restart me, "
-                   "and figure out what made that happen "
-                   "so you can stop it happening again. "
-                   "(Usually, it means you tried to give me a nick "
-                   "that's protected by NickServ.)") % bot.nick
-        debug_msg = ("Nick changed by server. "
-            "This can cause unexpected behavior. Please restart the bot.")
+        privmsg = (
+            "Hi, I'm your bot, %s. Something has made my nick change. This "
+            "can cause some problems for me, and make me do weird things. "
+            "You'll probably want to restart me, and figure out what made "
+            "that happen so you can stop it happening again. (Usually, it "
+            "means you tried to give me a nick that's protected by NickServ.)"
+        ) % bot.nick
+        debug_msg = (
+            "Nick changed by server. This can cause unexpected behavior. "
+            "Please restart the bot."
+        )
         LOGGER.critical(debug_msg)
-        bot.msg(bot.config.core.owner, privmsg)
+        bot.say(privmsg, bot.config.core.owner)
         return
 
     for channel in bot.privileges:
@@ -320,7 +342,6 @@ def track_part(bot, trigger):
     _remove_from_channel(bot, nick, channel)
 
 
-@sopel.module.rule('.*')
 @sopel.module.event('KICK')
 @sopel.module.priority('high')
 @sopel.module.thread(False)
@@ -376,17 +397,42 @@ def _send_who(bot, channel):
         # We might be on an old network, but we still care about keeping our
         # user list updated
         bot.write(['WHO', channel])
+    bot.channels[Identifier(channel)].last_who = datetime.datetime.utcnow()
 
 
-@sopel.module.rule('.*')
+@sopel.module.interval(30)
+def _periodic_send_who(bot):
+    """Periodically send a WHO request to keep user information up-to-date."""
+    if 'away-notify' in bot.enabled_capabilities:
+        # WHO not needed to update 'away' status
+        return
+
+    # Loops through the channels to find the one that has the longest time since the last WHO
+    # request, and issues a WHO request only if the last request for the channel was more than
+    # 120 seconds ago.
+    who_trigger_time = datetime.datetime.utcnow() - datetime.timedelta(seconds=120)
+    selected_channel = None
+    for channel_name, channel in bot.channels.items():
+        if channel.last_who is None:
+            # WHO was never sent yet to this channel: stop here
+            selected_channel = channel_name
+            break
+        if channel.last_who < who_trigger_time:
+            # this channel's last who request is the most outdated one at the moment
+            selected_channel = channel_name
+            who_trigger_time = channel.last_who
+
+    if selected_channel is not None:
+        # selected_channel's last who is either none or the oldest valid
+        _send_who(bot, selected_channel)
+
+
 @sopel.module.event('JOIN')
 @sopel.module.priority('high')
 @sopel.module.thread(False)
 @sopel.module.unblockable
 def track_join(bot, trigger):
     if trigger.nick == bot.nick and trigger.sender not in bot.channels:
-        bot.write(('TOPIC', trigger.sender))
-
         bot.privileges[trigger.sender] = dict()
         bot.channels[trigger.sender] = Channel(trigger.sender)
         _send_who(bot, trigger.sender)
@@ -405,7 +451,6 @@ def track_join(bot, trigger):
         user.account = trigger.args[1]
 
 
-@sopel.module.rule('.*')
 @sopel.module.event('QUIT')
 @sopel.module.priority('high')
 @sopel.module.thread(False)
@@ -418,16 +463,15 @@ def track_quit(bot, trigger):
     bot.users.pop(trigger.nick, None)
 
 
-@sopel.module.rule('.*')
 @sopel.module.event('CAP')
 @sopel.module.thread(False)
 @sopel.module.priority('high')
 @sopel.module.unblockable
-def recieve_cap_list(bot, trigger):
+def receive_cap_list(bot, trigger):
     cap = trigger.strip('-=~')
-    # Server is listing capabilites
+    # Server is listing capabilities
     if trigger.args[1] == 'LS':
-        recieve_cap_ls_reply(bot, trigger)
+        receive_cap_ls_reply(bot, trigger)
     # Server denied CAP REQ
     elif trigger.args[1] == 'NAK':
         entry = bot._cap_reqs.get(cap, None)
@@ -471,10 +515,10 @@ def recieve_cap_list(bot, trigger):
                 if req.success:
                     req.success(bot, req.prefix + trigger)
             if cap == 'sasl':  # TODO why is this not done with bot.cap_req?
-                recieve_cap_ack_sasl(bot)
+                receive_cap_ack_sasl(bot)
 
 
-def recieve_cap_ls_reply(bot, trigger):
+def receive_cap_ls_reply(bot, trigger):
     if bot.server_capabilities:
         # We've already seen the results, so someone sent CAP LS from a module.
         # We're too late to do SASL, and we don't want to send CAP END before
@@ -496,10 +540,16 @@ def recieve_cap_ls_reply(bot, trigger):
 
     # If some other module requests it, we don't need to add another request.
     # If some other module prohibits it, we shouldn't request it.
-    core_caps = ['multi-prefix', 'away-notify', 'cap-notify', 'server-time']
+    core_caps = [
+        'echo-message',
+        'multi-prefix',
+        'away-notify',
+        'cap-notify',
+        'server-time',
+    ]
     for cap in core_caps:
         if cap not in bot._cap_reqs:
-            bot._cap_reqs[cap] = [_CapReq('', 'coretasks')]
+            bot._cap_reqs[cap] = [CapReq('', 'coretasks')]
 
     def acct_warn(bot, cap):
         LOGGER.info('Server does not support %s, or it conflicts with a custom '
@@ -513,7 +563,7 @@ def recieve_cap_ls_reply(bot, trigger):
     auth_caps = ['account-notify', 'extended-join', 'account-tag']
     for cap in auth_caps:
         if cap not in bot._cap_reqs:
-            bot._cap_reqs[cap] = [_CapReq('', 'coretasks', acct_warn)]
+            bot._cap_reqs[cap] = [CapReq('', 'coretasks', acct_warn)]
 
     for cap, reqs in iteritems(bot._cap_reqs):
         # At this point, we know mandatory and prohibited don't co-exist, but
@@ -539,19 +589,26 @@ def recieve_cap_ls_reply(bot, trigger):
 
     # If we want to do SASL, we have to wait before we can send CAP END. So if
     # we are, wait on 903 (SASL successful) to send it.
-    if bot.config.core.auth_method == 'sasl':
+    if bot.config.core.auth_method == 'sasl' or bot.config.core.server_auth_method == 'sasl':
         bot.write(('CAP', 'REQ', 'sasl'))
     else:
         bot.write(('CAP', 'END'))
 
 
-def recieve_cap_ack_sasl(bot):
+def receive_cap_ack_sasl(bot):
     # Presumably we're only here if we said we actually *want* sasl, but still
     # check anyway.
-    password = bot.config.core.auth_password
+    password = None
+    mech = None
+    if bot.config.core.auth_method == 'sasl':
+        password = bot.config.core.auth_password
+        mech = bot.config.core.auth_target
+    elif bot.config.core.server_auth_method == 'sasl':
+        password = bot.config.core.server_auth_password
+        mech = bot.config.core.server_auth_sasl_mech
     if not password:
         return
-    mech = bot.config.core.auth_target or 'PLAIN'
+    mech = mech or 'PLAIN'
     bot.write(('AUTHENTICATE', mech))
 
 
@@ -587,20 +644,25 @@ def send_authenticate(bot, token):
 
 
 @sopel.module.event('AUTHENTICATE')
-@sopel.module.rule('.*')
 def auth_proceed(bot, trigger):
     if trigger.args[0] != '+':
         # How did we get here? I am not good with computer.
         return
     # Is this right?
-    sasl_username = bot.config.core.auth_username or bot.nick
-    sasl_password = bot.config.core.auth_password
+    if bot.config.core.auth_method == 'sasl':
+        sasl_username = bot.config.core.auth_username
+        sasl_password = bot.config.core.auth_password
+    elif bot.config.core.server_auth_method == 'sasl':
+        sasl_username = bot.config.core.server_auth_username
+        sasl_password = bot.config.core.server_auth_password
+    else:
+        return
+    sasl_username = sasl_username or bot.nick
     sasl_token = '\0'.join((sasl_username, sasl_username, sasl_password))
     send_authenticate(bot, sasl_token)
 
 
 @sopel.module.event(events.RPL_SASLSUCCESS)
-@sopel.module.rule('.*')
 def sasl_success(bot, trigger):
     bot.write(('CAP', 'END'))
 
@@ -692,7 +754,6 @@ def blocks(bot, trigger):
 
 
 @sopel.module.event('ACCOUNT')
-@sopel.module.rule('.*')
 def account_notify(bot, trigger):
     if trigger.nick not in bot.users:
         bot.users[trigger.nick] = User(trigger.nick, trigger.user, trigger.host)
@@ -703,7 +764,6 @@ def account_notify(bot, trigger):
 
 
 @sopel.module.event(events.RPL_WHOSPCRPL)
-@sopel.module.rule('.*')
 @sopel.module.priority('high')
 @sopel.module.unblockable
 def recv_whox(bot, trigger):
@@ -722,42 +782,51 @@ def _record_who(bot, channel, user, host, nick, account=None, away=None, modes=N
     nick = Identifier(nick)
     channel = Identifier(channel)
     if nick not in bot.users:
-        bot.users[nick] = User(nick, user, host)
-    user = bot.users[nick]
-    if account == '0':
-        user.account = None
+        usr = User(nick, user, host)
+        bot.users[nick] = usr
     else:
-        user.account = account
-    user.away = away
+        usr = bot.users[nick]
+        # check for & fill in sparse User added by handle_names()
+        if usr.host is None and host:
+            usr.host = host
+        if usr.user is None and user:
+            usr.user = user
+    if account == '0':
+        usr.account = None
+    else:
+        usr.account = account
+    if away is not None:
+        usr.away = away
     priv = 0
     if modes:
-        mapping = {'+': sopel.module.VOICE,
-           '%': sopel.module.HALFOP,
-           '@': sopel.module.OP,
-           '&': sopel.module.ADMIN,
-           '~': sopel.module.OWNER}
+        mapping = {
+            "+": sopel.module.VOICE,
+            "%": sopel.module.HALFOP,
+            "@": sopel.module.OP,
+            "&": sopel.module.ADMIN,
+            "~": sopel.module.OWNER,
+        }
         for c in modes:
             priv = priv | mapping[c]
     if channel not in bot.channels:
         bot.channels[channel] = Channel(channel)
-    bot.channels[channel].add_user(user, privs=priv)
+    bot.channels[channel].add_user(usr, privs=priv)
     if channel not in bot.privileges:
         bot.privileges[channel] = dict()
     bot.privileges[channel][nick] = priv
 
 
 @sopel.module.event(events.RPL_WHOREPLY)
-@sopel.module.rule('.*')
 @sopel.module.priority('high')
 @sopel.module.unblockable
 def recv_who(bot, trigger):
     channel, user, host, _, nick, status = trigger.args[1:7]
+    away = 'G' in status
     modes = ''.join([c for c in status if c in '~&@%+'])
-    _record_who(bot, channel, user, host, nick, modes=modes)
+    _record_who(bot, channel, user, host, nick, away=away, modes=modes)
 
 
 @sopel.module.event(events.RPL_ENDOFWHO)
-@sopel.module.rule('.*')
 @sopel.module.priority('high')
 @sopel.module.unblockable
 def end_who(bot, trigger):
@@ -765,7 +834,6 @@ def end_who(bot, trigger):
         who_reqs.pop(trigger.args[1], None)
 
 
-@sopel.module.rule('.*')
 @sopel.module.event('AWAY')
 @sopel.module.priority('high')
 @sopel.module.thread(False)
@@ -777,7 +845,6 @@ def track_notify(bot, trigger):
     user.away = bool(trigger.args)
 
 
-@sopel.module.rule('.*')
 @sopel.module.event('TOPIC')
 @sopel.module.event(events.RPL_TOPIC)
 @sopel.module.priority('high')
@@ -791,3 +858,21 @@ def track_topic(bot, trigger):
     if channel not in bot.channels:
         return
     bot.channels[channel].topic = trigger.args[-1]
+
+
+@sopel.module.rule(r'(?u).*(.+://\S+).*')
+@sopel.module.unblockable
+def handle_url_callbacks(bot, trigger):
+    """Dispatch callbacks on URLs
+
+    For each URL found in the trigger, trigger the URL callback registered by
+    the ``@url`` decorator.
+    """
+    schemes = bot.config.core.auto_url_schemes
+    # find URLs in the trigger
+    for url in sopel.tools.web.search_urls(trigger, schemes=schemes):
+        # find callbacks for said URL
+        for function, match in bot.search_url_callbacks(url):
+            # trigger callback defined by the `@url` decorator
+            if hasattr(function, 'url_regex'):
+                function(bot, trigger, match=match)

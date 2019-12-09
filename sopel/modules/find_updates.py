@@ -1,18 +1,22 @@
 # coding=utf-8
-"""Update checking module for Sopel.
-
+"""
+find_updates.py - Sopel Update Check Module
 This is separated from version.py, so that it can be easily overridden by
 distribution packagers, and they can check their repositories rather than the
 Sopel website.
+Copyright 2014, Elsie Powell, embolalia.com
+Licensed under the Eiffel Forum License 2.
+
+https://sopel.chat
 """
-# Copyright 2014, Elsie Powell, embolalia.com
-# Licensed under the Eiffel Forum License 2.
 from __future__ import unicode_literals, absolute_import, print_function, division
+
+import requests
 
 import sopel
 import sopel.module
-import requests
 import sopel.tools
+
 
 wait_time = 24 * 60 * 60  # check once per day
 startup_check_run = False
@@ -28,7 +32,6 @@ unstable_message = (
 
 
 @sopel.module.event(sopel.tools.events.RPL_LUSERCLIENT)
-@sopel.module.rule('.*')
 def startup_version_check(bot, trigger):
     global startup_check_run
     if not startup_check_run:
@@ -42,7 +45,7 @@ def check_version(bot):
 
     # TODO: Python3 specific. Disable urllib warning from config file.
     # requests.packages.urllib3.disable_warnings()
-    info = requests.get(version_url, verify=bot.config.core.verify_ssl).json()
+    info = requests.get(version_url).json()
     if version.releaselevel == 'final':
         latest = info['version']
         notes = info['release_notes']
@@ -55,4 +58,4 @@ def check_version(bot):
     msg = message.format(latest, sopel.__version__, notes)
 
     if version < latest_version:
-        bot.msg(bot.config.core.owner, msg)
+        bot.say(msg, bot.config.core.owner)

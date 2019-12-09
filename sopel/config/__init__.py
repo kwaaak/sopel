@@ -1,15 +1,46 @@
 # coding=utf-8
-"""
-The config object provides a simplified to access Sopel's configuration file.
-The sections of the file are attributes of the object, and the keys in the
-section are attributes of that. So, for example, the ``eggs`` attribute in the
-``[spam]`` section can be accessed from ``config.spam.eggs``.
+"""Sopel's configuration module.
 
-Section definitions (see "Section configuration sections" below) can be added
-to the config object with ``define_section``. When this is done, only the
-defined keys will be available. A section can not be given more than one
-definition. The ``[core]`` section is defined with ``CoreSection`` when the
-object is initialized.
+The :class:`~sopel.config.Config` object provides an interface to access Sopel's
+configuration file. It exposes the configuration's sections through its
+attributes as objects, which in turn expose their directives through *their*
+attributes.
+
+For example this is how to access ``core.nick`` on a :class:`Config` object::
+
+    >>> from sopel import config
+    >>> settings = config.Config('/sopel/config.cfg')
+    >>> settings.core.nick
+    'Sopel'
+
+The configuration file being:
+
+.. code-block:: ini
+
+    [core]
+    nick = Sopel
+    host = irc.freenode.org
+    use_ssl = true
+    port = 6697
+    owner = dgw
+    channels =
+        "#sopel"
+
+A section can be represented by a subclass of
+:class:`~sopel.config.types.StaticSection`; for example a ``[spam]`` section
+with ``eggs`` and ``bacon`` can be defined like this::
+
+    from sopel import config
+
+    class SpamSection(config.types.StaticSection):
+        eggs = config.types.ListAttribute('eggs')
+        bacon = config.types.ValidatedAttribute('bacon')
+
+The ``[core]`` section itself is represented by the
+:class:`~sopel.config.core_section.CoreSection` class, which is a subclass of
+:class:`~sopel.config.types.StaticSection`. It is automatically added when
+the :class:`Config` object is instantiated; it uses
+:meth:`Config.define_section` for that purpose.
 
 .. versionadded:: 6.0.0
 """
@@ -19,20 +50,27 @@ object is initialized.
 
 from __future__ import unicode_literals, absolute_import, print_function, division
 
-from sopel.tools import iteritems, stderr
-import sopel.tools
-from sopel.tools import get_input
-import sopel.loader
 import os
 import sys
+
+from sopel import tools
+from . import core_section, types
+
 if sys.version_info.major < 3:
     import ConfigParser
 else:
     basestring = str
     import configparser as ConfigParser
-import sopel.config.core_section
-from sopel.config.types import StaticSection
 
+
+__all__ = [
+    'core_section',
+    'types',
+    'DEFAULT_HOMEDIR',
+    'ConfigurationError',
+    'ConfigurationNotFound',
+    'Config',
+]
 
 DEFAULT_HOMEDIR = os.path.join(os.path.expanduser('~'), '.sopel')
 
@@ -49,6 +87,7 @@ class ConfigurationError(Exception):
 class ConfigurationNotFound(ConfigurationError):
     """Configuration file not found."""
     def __init__(self, filename):
+        super(ConfigurationNotFound, self).__init__(None)
         self.filename = filename
         """Path to the configuration file not found"""
 
@@ -69,10 +108,17 @@ class Config(object):
         config file, or a config file is not loaded. They are documented below.
         """
         self.filename = filename
-        """The config object's associated file, as noted above."""
+        """The config object's associated file."""
+        basename, _ = os.path.splitext(os.path.basename(filename))
+        self.basename = basename
+        """The config's base filename, i.e. the filename without the extension.
+
+        If the filename is ``freenode.config.cfg``, then the ``basename`` will
+        be ``freenode.config``.
+        """
         self.parser = ConfigParser.RawConfigParser(allow_no_value=True)
         self.parser.read(self.filename)
-        self.define_section('core', sopel.config.core_section.CoreSection,
+        self.define_section('core', core_section.CoreSection,
                             validate=validate)
         self.get = self.parser.get
 
@@ -113,10 +159,10 @@ class Config(object):
         already been defined with a different class, ValueError is raised.
 
         If ``validate`` is True, the section's values will be validated, and an
-        exception raised if they are invalid. This is desirable in a module's
+        exception raised if they are invalid. This is desirable in a plugin's
         setup function, for example, but might not be in the configure function.
         """
-        if not issubclass(cls_, StaticSection):
+        if not issubclass(cls_, types.StaticSection):
             raise ValueError("Class must be a subclass of StaticSection.")
         current = getattr(self, name, None)
         current_name = str(current.__class__)
@@ -150,6 +196,9 @@ class Config(object):
         def __getattr__(self, name):
             return None
 
+        def __contains__(self, name):
+            return name in vars(self)
+
         def __setattr__(self, name, value):
             object.__setattr__(self, name, value)
             if type(value) is list:
@@ -176,6 +225,12 @@ class Config(object):
             raise AttributeError("%r object has no attribute %r"
                                  % (type(self).__name__, name))
 
+    def __getitem__(self, name):
+        return self.__getattr__(name)
+
+    def __contains__(self, name):
+        return name in self.parser.sections()
+
     def option(self, question, default=False):
         """Ask "y/n" and return the corresponding boolean answer.
 
@@ -188,88 +243,7 @@ class Config(object):
         d = 'n'
         if default:
             d = 'y'
-        ans = get_input(question + ' (y/n)? [' + d + '] ')
+        ans = tools.get_input(question + ' (y/n)? [' + d + '] ')
         if not ans:
             ans = d
         return ans.lower() == 'y'
-
-    def _modules(self):
-        home = os.getcwd()
-        modules_dir = os.path.join(home, 'modules')
-        filenames = sopel.loader.enumerate_modules(self)
-        os.sys.path.insert(0, modules_dir)
-        for name, mod_spec in iteritems(filenames):
-            path, type_ = mod_spec
-            try:
-                module, _ = sopel.loader.load_module(name, path, type_)
-            except Exception as e:
-                filename, lineno = sopel.tools.get_raising_file_and_line()
-                rel_path = os.path.relpath(filename, os.path.dirname(__file__))
-                raising_stmt = "%s:%d" % (rel_path, lineno)
-                stderr("Error loading %s: %s (%s)" % (name, e, raising_stmt))
-            else:
-                if hasattr(module, 'configure'):
-                    prompt = name + ' module'
-                    if module.__doc__:
-                        doc = module.__doc__.split('\n', 1)[0]
-                        if doc:
-                            prompt = doc
-                    prompt = 'Configure {} (y/n)? [n]'.format(prompt)
-                    do_configure = get_input(prompt)
-                    do_configure = do_configure and do_configure.lower() == 'y'
-                    if do_configure:
-                        module.configure(self)
-        self.save()
-
-
-def _wizard(section, config=None):
-    dotdir = os.path.dirname(config) if config is not None else DEFAULT_HOMEDIR
-    configpath = os.path.join(dotdir, ((config or 'default.cfg') + ('.cfg' if config and not config.endswith('.cfg') else '')))
-    if section == 'all':
-        _create_config(configpath)
-    elif section == 'mod':
-        _check_dir(dotdir, False)
-        if not os.path.isfile(configpath):
-            print("No config file found." +
-                  " Please make one before configuring these options.")
-            sys.exit(1)
-        config = Config(configpath, validate=False)
-        config._modules()
-
-
-def _check_dir(path=DEFAULT_HOMEDIR, create=True):
-    if not os.path.isdir(path):
-        if create:
-            print('Creating a config directory at {}...'.format(path))
-            try:
-                os.makedirs(path)
-            except Exception as e:
-                print('There was a problem creating %s:' % path, file=sys.stderr)
-                print('%s, %s' % (e.__class__, str(e)), file=sys.stderr)
-                print('Please fix this and then run Sopel again.', file=sys.stderr)
-                sys.exit(1)
-        else:
-            print("No config file found. Please make one before configuring these options.")
-            sys.exit(1)
-
-
-def _create_config(configpath):
-    _check_dir(os.path.dirname(configpath))
-    print("Please answer the following questions" +
-          " to create your configuration file:\n")
-    try:
-        config = Config(configpath, validate=False)
-        sopel.config.core_section.configure(config)
-        if config.option(
-            'Would you like to see if there are any modules'
-            ' that need configuring'
-        ):
-            config._modules()
-        config.save()
-    except Exception:  # TODO: Be specific
-        print("Encountered an error while writing the config file." +
-              " This shouldn't happen. Check permissions.")
-        raise
-
-    print("Config file written successfully!")
-    return config.filename

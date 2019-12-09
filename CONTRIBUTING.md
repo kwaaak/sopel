@@ -1,6 +1,5 @@
 Submitting Issues
 -----------------
-
 When submitting issues to our
 [issue tracker](https://github.com/sopel-irc/sopel/issues), it's important
 that you do the following:
@@ -32,6 +31,11 @@ include your changes.
   the rest of the rules.
 * Test your code before you commit. We don't have a formal testing plan in
   place, but you should make sure your code works as promised before you commit.
+* If you have cloned the repository to your personal computer, you can use our
+  provided git hooks to automatically check whether your code style is up to
+  Sopel's requirements and that tests still pass, before committing your code.
+  The git hooks can be enabled by running `make install-hooks`, and disabled by
+  running `make uninstall-hooks`,  in your root `sopel` folder.
 * Make your commit messages clear and explicative. Our convention is to place
   the name of the thing you're changing in at the beginning of the
   message, followed by a colon: the module name for modules, docs for documentation files,
@@ -64,3 +68,20 @@ to the tags we use:
 * High Priority     - Things that should've been done yesterday
 * Tests             - Issues regarding the testing unit in tests/
 * Windows           - Windows-specific bugs are labelled as such
+
+Conduct
+-------
+Sopel is an inclusive project. The fact that it even exists today is thanks to
+a diverse cast of contributors from around the world. Indeed, we would not be
+here if not for the hard work and dedication of many people who, elsewhere,
+might have been discriminated against simply because of who they are.
+
+For that reason—and because it's just The Right Thing To Do™—everyone in the
+Sopel community is expected to be professional and respectful at all times,
+whether collaborating on code or just bantering in our IRC channel. Basically,
+don't be a jerk, don't make personal attacks, and listen if someone else tells
+you to back off. Listen _harder_ if more than one person does so.
+
+Everyone involved with the Sopel project _is a person_, not a collection of
+labels (unlike our issue tracker, which is the reverse). Remember that, but
+don't forget to be awesome!
